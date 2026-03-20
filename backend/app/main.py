@@ -1,4 +1,5 @@
 from fastapi import FastAPI
+from fastapi.responses import Response
 from app.db.database import engine, Base
 from app.db.migrations_runtime import ensure_users_plan_expires_column
 import app.db.base
@@ -137,6 +138,12 @@ async def startup_event():
 @app.get("/")
 def root():
     return {"message": "Stock Platform API is running"}
+
+
+@app.head("/")
+def root_head():
+    """Render 等平台可能對 / 發 HEAD 探活；僅 GET 會回 405。"""
+    return Response(status_code=200)
 
 
 @app.get("/health/routes")
