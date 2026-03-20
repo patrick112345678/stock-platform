@@ -1,5 +1,8 @@
-from fastapi import FastAPI
-from fastapi.responses import Response
+from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse, Response
+from sqlalchemy import text
+from sqlalchemy.exc import SQLAlchemyError
+
 from app.db.database import engine, Base
 from app.db.migrations_runtime import ensure_users_plan_expires_column
 import app.db.base
@@ -28,6 +31,20 @@ from app.services.scanner_service import (
 )
 
 app = FastAPI()
+
+
+@app.exception_handler(SQLAlchemyError)
+async def sqlalchemy_exception_handler(request: Request, exc: SQLAlchemyError):
+    """登入/註冊查庫失敗時回 JSON，避免只剩 500 Internal Server Error 無法排查"""
+    return JSONResponse(
+        status_code=503,
+        content={
+            "detail": "資料庫錯誤，請檢查 DATABASE_URL 與 PostgreSQL 是否已連結到本服務。",
+            "error_type": type(exc).__name__,
+            "error": str(exc)[:800],
+        },
+    )
+
 
 # CORS：不可同時 allow_origins=["*"] 與 allow_credentials=True（瀏覽器會擋跨網域 fetch →「Failed to fetch」）
 # 本專案用 Bearer token，不靠 cookie，故 credentials=False 即可。
@@ -145,6 +162,29 @@ def root():
 def root_head():
     """Render 等平台可能對 / 發 HEAD 探活；僅 GET 會回 405。"""
     return Response(status_code=200)
+
+
+@app.get("/health/db")
+def health_db():
+    """在瀏覽器開此網址可確認 Render 是否真的連上 PostgreSQL（與 / 不同，/ 不會碰資料庫）"""
+    try:
+        with engine.connect() as conn:
+            conn.execute(text("SELECT 1"))
+        return {
+            "ok": True,
+            "dialect": engine.dialect.name,
+            "message": "資料庫連線正常",
+        }
+    except Exception as e:
+        return JSONResponse(
+            status_code=503,
+            content={
+                "ok": False,
+                "error_type": type(e).__name__,
+                "message": str(e)[:800],
+                "hint": "在 Render：PostgreSQL 實例 → Connect → 複製「Internal Database URL」到「後端 Web Service」的 Environment 變數 DATABASE_URL，並儲存後重新部署後端。",
+            },
+        )
 
 
 @app.get("/health/routes")
