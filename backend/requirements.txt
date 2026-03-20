@@ -6,7 +6,8 @@ sqlalchemy>=2.0
 python-dotenv
 python-jose[cryptography]
 passlib[bcrypt]
-bcrypt
+# bcrypt 4.1+ 常與 passlib 1.7.x 不相容，導致登入 500；鎖在 4.0.x
+bcrypt>=4.0.1,<4.1
 pydantic[email]
 
 # 正式環境若用 PostgreSQL，取消下一行註解（SQLite 不需）

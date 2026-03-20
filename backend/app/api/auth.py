@@ -2,6 +2,7 @@ from datetime import datetime
 
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
+from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from app.db.database import get_db
@@ -59,27 +60,44 @@ oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/auth/login")
 
 @router.post("/register", response_model=UserResponse)
 def register(data: RegisterRequest, db: Session = Depends(get_db)):
-    existing_user = db.query(User).filter(User.username == data.username).first()
-    if existing_user:
-        raise HTTPException(status_code=400, detail="Username already exists")
+    try:
+        existing_user = db.query(User).filter(User.username == data.username).first()
+        if existing_user:
+            raise HTTPException(status_code=400, detail="Username already exists")
 
-    existing_email = db.query(User).filter(User.email == data.email).first()
-    if existing_email:
-        raise HTTPException(status_code=400, detail="Email already exists")
+        existing_email = db.query(User).filter(User.email == data.email).first()
+        if existing_email:
+            raise HTTPException(status_code=400, detail="Email already exists")
 
-    user = User(
-        username=data.username,
-        email=data.email,
-        password_hash=hash_password(data.password),
-        plan_code="free",
-        role="user",
-        status="active",
-    )
+        user = User(
+            username=data.username,
+            email=data.email,
+            password_hash=hash_password(data.password),
+            plan_code="free",
+            role="user",
+            status="active",
+        )
 
-    db.add(user)
-    db.commit()
-    db.refresh(user)
-    return _user_response(user)
+        db.add(user)
+        db.commit()
+        db.refresh(user)
+        return _user_response(user)
+    except HTTPException:
+        raise
+    except IntegrityError:
+        db.rollback()
+        raise HTTPException(
+            status_code=400,
+            detail="Username or email already exists",
+        ) from None
+    except SQLAlchemyError:
+        raise
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(
+            status_code=500,
+            detail=f"註冊失敗：{type(e).__name__}: {str(e)[:500]}",
+        ) from e
 
 
 @router.post("/login", response_model=TokenResponse)
@@ -87,21 +105,33 @@ def login(
     form_data: OAuth2PasswordRequestForm = Depends(),
     db: Session = Depends(get_db)
 ):
-    user = db.query(User).filter(User.username == form_data.username).first()
-    if not user:
-        raise HTTPException(status_code=401, detail="Invalid username or password")
+    try:
+        user = db.query(User).filter(User.username == form_data.username).first()
+        if not user:
+            raise HTTPException(status_code=401, detail="Invalid username or password")
 
-    if not verify_password(form_data.password, user.password_hash):
-        raise HTTPException(status_code=401, detail="Invalid username or password")
+        if not verify_password(form_data.password, user.password_hash):
+            raise HTTPException(status_code=401, detail="Invalid username or password")
 
-    access_token = create_access_token(
-        data={"sub": str(user.id), "username": user.username}
-    )
+        access_token = create_access_token(
+            data={"sub": str(user.id), "username": user.username}
+        )
 
-    return {
-        "access_token": access_token,
-        "token_type": "bearer"
-    }
+        return {
+            "access_token": access_token,
+            "token_type": "bearer",
+        }
+    except HTTPException:
+        raise
+    except SQLAlchemyError:
+        # 交給 main.py 的 SQLAlchemyError handler（JSON 503）
+        raise
+    except Exception as e:
+        # bcrypt/passlib 等若噴錯，Swagger 只會看到 500；改回可讀 JSON
+        raise HTTPException(
+            status_code=500,
+            detail=f"登入處理失敗：{type(e).__name__}: {str(e)[:500]}",
+        ) from e
 
 
 @router.get("/me", response_model=UserResponse)
