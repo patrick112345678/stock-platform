@@ -29,11 +29,12 @@ from app.services.scanner_service import (
 
 app = FastAPI()
 
-# CORS（開發時放寬，避免連線問題）
+# CORS：不可同時 allow_origins=["*"] 與 allow_credentials=True（瀏覽器會擋跨網域 fetch →「Failed to fetch」）
+# 本專案用 Bearer token，不靠 cookie，故 credentials=False 即可。
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_credentials=True,
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
