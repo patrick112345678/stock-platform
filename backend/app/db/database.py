@@ -19,7 +19,13 @@ if not _raw:
 
 DATABASE_URL = _raw
 
-engine = create_engine(DATABASE_URL)
+# Render 上 PostgreSQL 多數需要 SSL；未加時登入查庫容易 500（畫面只顯示 Internal Server Error）
+_engine_kw: dict = {"pool_pre_ping": True}
+if DATABASE_URL.startswith("postgresql") and os.getenv("RENDER"):
+    if "sslmode=" not in DATABASE_URL and "ssl=" not in DATABASE_URL.lower():
+        _engine_kw["connect_args"] = {"sslmode": "require"}
+
+engine = create_engine(DATABASE_URL, **_engine_kw)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
 Base = declarative_base()
