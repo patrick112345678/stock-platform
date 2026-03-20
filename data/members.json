@@ -1,0 +1,43 @@
+{
+  "users": {
+    "admin": {
+      "password_hash": "$2b$12$kHyVz5xtcZjEoShoSngiG.T/Dax3QiBOXGLBmJApFaR.oXXbFeu/u",
+      "role": "admin",
+      "plan": "admin",
+      "ai_used": 0,
+      "created_at": "2026-03-13T09:07:06.032771",
+      "username": "admin",
+      "email": "",
+      "failed_login_count": 0,
+      "lock_until": null,
+      "last_login_at": "2026-03-13T16:27:16.121119"
+    },
+    "123456": {
+      "password_hash": "8d969eef6ecad3c29a3a629280e686cf0c3f5d5a86aff3ca12020c923adc6c92",
+      "role": "free",
+      "plan": "free",
+      "ai_used": 10,
+      "created_at": "2026-03-13T09:16:08.226453",
+      "failed_login_count": 4,
+      "lock_until": null,
+      "last_login_at": "2026-03-13T14:14:10.736416"
+    },
+    "a2805678": {
+      "username": "a2805678",
+      "email": "a2805678@gmai.com",
+      "password_hash": "$2b$12$v1rpndNiE0FuNsJNy0YYeOtLMHRSR5kUikcyBmas92xtl5U4UR8xu",
+      "role": "free",
+      "plan": "free",
+      "ai_used": 3,
+      "created_at": "2026-03-13T14:25:14.234446",
+      "failed_login_count": 0,
+      "lock_until": null,
+      "email_verified": false,
+      "last_login_at": "2026-03-13T17:55:08.253304",
+      "watchlist": [
+        "AAPL",
+        "ETHUSDT"
+      ]
+    }
+  }
+}

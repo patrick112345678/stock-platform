@@ -1,0 +1,25 @@
+# ========== API 執行（部署必備）==========
+fastapi>=0.109
+uvicorn[standard]>=0.27
+python-multipart
+sqlalchemy>=2.0
+python-dotenv
+python-jose[cryptography]
+passlib[bcrypt]
+bcrypt
+pydantic[email]
+
+# 正式環境若用 PostgreSQL，取消下一行註解（SQLite 不需）
+psycopg2-binary
+
+# ========== 專案功能 ==========
+yfinance>=1.0
+pandas
+numpy
+requests
+google-genai
+pycryptodome
+
+# ========== 選用：若不再跑 Streamlit 儀表板可刪除以下兩行 ==========
+#streamlit
+#streamlit-lightweight-charts-v5
