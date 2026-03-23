@@ -1,5 +1,5 @@
 from typing import List
-from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query
 
 from sqlalchemy.orm import Session
 
@@ -17,8 +17,6 @@ from app.services.scanner_service import (
     get_opportunities,
     get_watchlist_opportunities,
     filter_symbols,
-    is_tw_market_hours,
-    refresh_tw_cache,
 )
 
 router = APIRouter(prefix="/scanner", tags=["scanner"])
@@ -34,7 +32,6 @@ def get_db():
 
 @router.get("/leaderboard", response_model=List[LeaderboardItem])
 def scanner_leaderboard(
-    background_tasks: BackgroundTasks,
     market: str = Query("US", pattern="^(TW|US|CRYPTO)$"),
     pool: str = Query("TOP100"),
     sort: str = Query("change_percent", pattern="^(change_percent|volume)$"),
@@ -42,9 +39,7 @@ def scanner_leaderboard(
     sort_direction: str = Query("gainers", pattern="^(gainers|losers)$"),
 ):
     try:
-        # 台股 9:00-13:30：先回快取，背景更新
-        if market == "TW" and is_tw_market_hours():
-            background_tasks.add_task(refresh_tw_cache)  # 背景更新快取，下次請求會拿到新資料
+        # 僅讀 DB 快取；全市場掃描請用外部排程寫入 scanner_cache
         return get_leaderboard(market=market, pool=pool, sort_by=sort, limit=limit, sort_direction=sort_direction)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"排行榜取得失敗: {str(e)}")
@@ -62,7 +57,7 @@ def scanner_opportunities(
 
 @router.post("/filter")
 def scanner_filter(req: ScannerFilterRequest):
-    """選股器：回傳 {items: [...], source: 'live'|'cache'}"""
+    """選股器：回傳 {items: [...], source: 'cache'}"""
     try:
         result = filter_symbols(req)
         return result

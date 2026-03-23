@@ -5,9 +5,7 @@ from typing import List, Dict, Any
 
 import pandas as pd
 import requests
-import yfinance as yf
-
-from app.services.yfinance_client import get_yfinance_session
+from app.services.stock_data_service import get_cached_stock_data
 from datetime import datetime, timedelta, time
 import json
 from app.db.database import SessionLocal
@@ -37,6 +35,9 @@ DEFAULT_CRYPTO_SYMBOLS = [
     "BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT", "DOGEUSDT",
     "BNBUSDT", "ADAUSDT", "AVAXUSDT", "LINKUSDT", "SUIUSDT"
 ]
+
+# 掃描 / universe：寫死最多 30，避免全市場請求與 Yahoo 爆炸
+SCANNER_UNIVERSE_MAX = 30
 
 US_SYMBOLS_CACHE = None
 US_SEARCH_CACHE: List[Dict[str, str]] | None = None
@@ -374,29 +375,25 @@ def normalize_us_symbol(symbol: str) -> str:
 
 
 def get_stock_hist(symbol: str, period: str = "6mo", interval: str = "1d") -> pd.DataFrame:
+    """
+    與行情 API 共用 get_cached_stock_data，避免重複打 Yahoo。
+    僅支援日線匯總（快取為 3mo 日線）；忽略 period/interval 差異以維持單一來源。
+    """
     if symbol.endswith(".TW"):
         yf_symbol = symbol
     else:
         yf_symbol = normalize_us_symbol(symbol)
 
-    df = yf.download(
-        yf_symbol,
-        period=period,
-        interval=interval,
-        progress=False,
-        auto_adjust=False,
-        threads=False,
-        group_by="column",
-        session=get_yfinance_session(),
-    )
+    bundle = get_cached_stock_data(yf_symbol)
+    if not bundle.get("ok") or bundle.get("hist") is None:
+        raise ValueError(f"抓不到股票資料: {yf_symbol}")
 
+    df = bundle["hist"]
     if df is None or df.empty:
         raise ValueError(f"抓不到股票資料: {yf_symbol}")
 
     if isinstance(df.columns, pd.MultiIndex):
         df.columns = df.columns.get_level_values(0)
-
-    # 去掉重複欄位，避免 Close / High / Low 變成多欄
     df = df.loc[:, ~df.columns.duplicated()]
 
     required = ["Open", "High", "Low", "Close", "Volume"]
@@ -414,7 +411,7 @@ def get_stock_hist(symbol: str, period: str = "6mo", interval: str = "1d") -> pd
 def get_bybit_spot_tickers() -> List[Dict[str, Any]]:
     url = f"{BYBIT_BASE_URL}/v5/market/tickers"
     params = {"category": "spot"}
-    r = requests.get(url, params=params, timeout=15, headers=REQUEST_HEADERS)
+    r = requests.get(url, params=params, timeout=5, headers=REQUEST_HEADERS)
     r.raise_for_status()
     data = r.json()
 
@@ -452,7 +449,7 @@ def get_bybit_kline(symbol: str, interval: str = "D", limit: int = 120) -> pd.Da
         "interval": interval,
         "limit": limit,
     }
-    r = requests.get(url, params=params, timeout=15, headers=REQUEST_HEADERS)
+    r = requests.get(url, params=params, timeout=5, headers=REQUEST_HEADERS)
     r.raise_for_status()
     data = r.json()
 
@@ -489,7 +486,7 @@ def get_binance_kline(symbol: str, interval: str = "D", limit: int = 120) -> pd.
     r = requests.get(
         url,
         params={"symbol": symbol, "interval": bi, "limit": limit},
-        timeout=15,
+        timeout=5,
         headers=REQUEST_HEADERS,
     )
     r.raise_for_status()
@@ -539,7 +536,7 @@ def get_binance_spot_tickers_normalized() -> List[Dict[str, Any]]:
     """Binance 全現貨 24h，格式對齊 Bybit tickers 列表以利後續排序／排行榜"""
     r = requests.get(
         f"{BINANCE_API_BASE}/ticker/24hr",
-        timeout=25,
+        timeout=5,
         headers=REQUEST_HEADERS,
     )
     r.raise_for_status()
@@ -592,7 +589,7 @@ def _fetch_twse_stock_day_all() -> List[Dict[str, Any]]:
     except Exception:
         verify = True
     try:
-        resp = requests.get(url, timeout=15, headers=headers, verify=verify)
+        resp = requests.get(url, timeout=5, headers=headers, verify=verify)
         resp.raise_for_status()
         data = resp.json()
     except requests.exceptions.SSLError as e:
@@ -600,7 +597,7 @@ def _fetch_twse_stock_day_all() -> List[Dict[str, Any]]:
         import urllib3
 
         urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-        resp = requests.get(url, timeout=15, headers=headers, verify=False)
+        resp = requests.get(url, timeout=5, headers=headers, verify=False)
         resp.raise_for_status()
         data = resp.json()
     if isinstance(data, dict) and "data" in data:
@@ -610,36 +607,21 @@ def _fetch_twse_stock_day_all() -> List[Dict[str, Any]]:
     return data
 
 
-def get_tw_universe(pool="TOP100"):
+def get_tw_universe(pool="TOP30"):
+    """
+    掃描用 universe：固定最多 SCANNER_UNIVERSE_MAX，不抓 TWSE 全量（避免大量請求）。
+    資料來源：tw_stock_master.json 前綴，失敗則 DEFAULT_TW_SYMBOLS。
+    """
     try:
-        data = _fetch_twse_stock_day_all()
-        symbols = [
-            item["Code"] + ".TW"
-            for item in data
-            if str(item.get("Code", "")).isdigit()
-        ]
-        if not symbols:
-            raise ValueError("TWSE returned empty symbol list")
-    except Exception as e:
-        print("❌ get_tw_universe failed:", repr(e))
-        # 優先使用專案內 tw_stock_master.json，比 DEFAULT_TW_SYMBOLS 完整
         fb = _load_tw_stock_master_fallback()
         symbols = [str(x["symbol"]).strip() + ".TW" for x in fb if x.get("symbol")]
         if not symbols:
             symbols = list(DEFAULT_TW_SYMBOLS)
+    except Exception as e:
+        print("❌ get_tw_universe failed:", repr(e))
+        symbols = list(DEFAULT_TW_SYMBOLS)
 
-    pool = str(pool).upper()
-
-    if pool == "TOP30":
-        return symbols[:30]
-    elif pool == "TOP100":
-        return symbols[:100]
-    elif pool == "TOP800":
-        return symbols[:800]
-    elif pool == "ALL":
-        return symbols
-    else:
-        return symbols[:100]
+    return symbols[:SCANNER_UNIVERSE_MAX]
 
 
 TW_SEARCH_CACHE: List[Dict[str, str]] | None = None
@@ -714,37 +696,9 @@ def enrich_tw_names(items: List[Dict[str, Any]], market: str = "TW") -> List[Dic
     return items
 
 
-def get_us_universe(pool="TOP100"):
-    global US_SYMBOLS_CACHE
-
-    if US_SYMBOLS_CACHE is None:
-        try:
-            url = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
-            headers = {"User-Agent": "Mozilla/5.0"}
-
-            resp = requests.get(url, headers=headers, timeout=10)
-            resp.raise_for_status()
-
-            df = pd.read_html(StringIO(resp.text))[0]
-            US_SYMBOLS_CACHE = df["Symbol"].astype(str).tolist()
-
-        except Exception as e:
-            print("❌ get_us_universe failed:", repr(e))
-            US_SYMBOLS_CACHE = DEFAULT_US_SYMBOLS.copy()
-
-    symbols = US_SYMBOLS_CACHE
-    pool = str(pool).upper()
-
-    if pool == "TOP30":
-        return symbols[:30]
-    elif pool == "TOP100":
-        return symbols[:100]
-    elif pool == "TOP800":
-        return symbols
-    elif pool == "ALL":
-        return symbols
-    else:
-        return symbols[:100]
+def get_us_universe(pool="TOP30"):
+    """掃描用：寫死 DEFAULT_US_SYMBOLS 前 30，不抓 Wikipedia。"""
+    return list(DEFAULT_US_SYMBOLS)[:SCANNER_UNIVERSE_MAX]
 
 
 def get_us_search_items() -> List[Dict[str, str]]:
@@ -755,7 +709,7 @@ def get_us_search_items() -> List[Dict[str, str]]:
     try:
         url = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
         headers = {"User-Agent": "Mozilla/5.0"}
-        resp = requests.get(url, headers=headers, timeout=10)
+        resp = requests.get(url, headers=headers, timeout=5)
         resp.raise_for_status()
         df = pd.read_html(StringIO(resp.text))[0]
         # 欄位可能是 Symbol/Security 或略有不同
@@ -774,31 +728,26 @@ def get_us_search_items() -> List[Dict[str, str]]:
         return [{"symbol": s, "name": s} for s in DEFAULT_US_SYMBOLS]
 
 
-def get_crypto_universe(pool: str = "TOP100") -> List[str]:
-    pool = str(pool).upper()
+def get_crypto_universe(pool: str = "TOP30") -> List[str]:
+    """掃描用：寫死 DEFAULT_CRYPTO_SYMBOLS 前 30，不在此請求 Bybit/Binance。"""
+    return list(DEFAULT_CRYPTO_SYMBOLS)[:SCANNER_UNIVERSE_MAX]
 
+
+def get_crypto_search_pool(limit: int = 200) -> List[str]:
+    """搜尋用：可嘗試即時交易所清單，失敗則靜態清單。"""
     try:
         tickers = get_spot_tickers_with_fallback()
         symbols = sorted(
             [x for x in tickers if x["symbol"].endswith("USDT")],
             key=lambda x: float(x.get("turnover24h") or 0),
-            reverse=True
+            reverse=True,
         )
-        symbols = [x["symbol"] for x in symbols]
+        out = [x["symbol"] for x in symbols]
+        if out:
+            return out[:limit]
     except Exception as e:
-        print("❌ get_crypto_universe failed:", repr(e))
-        symbols = DEFAULT_CRYPTO_SYMBOLS
-
-    if pool == "TOP30":
-        return symbols[:30]
-    elif pool == "TOP100":
-        return symbols[:100]
-    elif pool == "TOP800":
-        return symbols[:800]
-    elif pool == "ALL":
-        return symbols
-    else:
-        return symbols[:100]
+        print("WARN get_crypto_search_pool:", repr(e))
+    return list(DEFAULT_CRYPTO_SYMBOLS)
 
 
 def build_opportunity_from_df(
@@ -945,20 +894,8 @@ def get_tw_opportunities(pool="TOP100", limit=20):
      return get_cached_results("TW", limit)
 
 def get_crypto_opportunities(limit=20):
-    """Crypto：以 10 分鐘背景快取為主；快取為空再即時抓（Bybit→Binance），失敗再回快取。"""
-    cached = get_cached_results("CRYPTO", max(limit, 80))
-    if cached:
-        return enrich_tw_names(cached[:limit], "CRYPTO")
-    try:
-        symbols = get_crypto_universe("ALL")[:200]
-        results = run_parallel(symbols, process_crypto_symbol)
-        items = [r for r in results if r]
-        if items:
-            items.sort(key=lambda x: x.get("score", 0), reverse=True)
-            return enrich_tw_names(items[:limit], "CRYPTO")
-    except Exception as e:
-        print("WARN get_crypto_opportunities live fetch failed:", repr(e))
-    return get_cached_results("CRYPTO", limit)
+    """僅讀 DB 快取；不在 API 請求時全市場掃描（排程預留給外部 cron）。"""
+    return enrich_tw_names(get_cached_results("CRYPTO", limit), "CRYPTO")
 
 def get_stock_leaderboard(sort: str = "change_percent", limit: int = 20) -> List[Dict[str, Any]]:
     results = []
@@ -1050,15 +987,8 @@ def is_tw_market_hours() -> bool:
 
 
 def refresh_tw_cache():
-    """背景更新台股快取（供排行榜/選股器）"""
-    try:
-        syms = get_tw_universe("ALL")
-        res = run_parallel(syms, process_tw_symbol)
-        res = sorted(res, key=lambda x: x.get("score", 0), reverse=True)
-        save_scanner_results(res, "TW")
-        print("🟢 TW cache refreshed (background)")
-    except Exception as e:
-        print("🔴 TW cache refresh failed:", repr(e))
+    """預留：應由外部排程 / worker 呼叫，勿在 API 請求鏈內全市場掃描。"""
+    print("🟡 refresh_tw_cache skipped (use scheduled job / admin endpoint)")
 
 
 def get_leaderboard(
@@ -1068,7 +998,7 @@ def get_leaderboard(
     limit: int = 20,
     sort_direction: str = "gainers",  # "gainers" | "losers"
 ):
-    """排行榜：台股/美股收盤後不變，直接用資料庫快取；Crypto 24h 交易則即時抓取"""
+    """排行榜：僅讀 DB 快取；不在 HTTP 請求內做全市場掃描。"""
     market = market.upper()
     reverse = sort_direction != "losers"
 
@@ -1078,29 +1008,9 @@ def get_leaderboard(
             return get_cached_results("CRYPTO", cache_limit)
         elif market == "TW":
             return get_cached_results("TW", cache_limit)
-        else:
-            return get_cached_results("US", cache_limit)
+        return get_cached_results("US", cache_limit)
 
-    def _live_crypto():
-        symbols = get_crypto_universe("ALL")[:200]
-        results = run_parallel(symbols, process_crypto_symbol)
-        return [r for r in results if r]
-
-    items = []
-    if market in ("TW", "US"):
-        # 台股、美股：收盤後資料不變，直接用快取，不即時重算
-        items = _from_cache()
-    else:
-        # Crypto：以 10 分鐘背景快取為主；快取為空再即時抓（Bybit→Binance），失敗再回快取
-        items = _from_cache()
-        if not items:
-            try:
-                items = _live_crypto()
-            except Exception as e:
-                print("WARN leaderboard crypto live fetch failed:", repr(e))
-        if not items:
-            items = _from_cache()
-
+    items = _from_cache()
     sorted_items = sorted(items, key=lambda x: x.get(sort_by) or 0, reverse=reverse)
     return enrich_tw_names(sorted_items[:limit], market)
 
@@ -1212,33 +1122,14 @@ def passes_filters(item: Dict[str, Any], req) -> bool:
 
 
 def filter_symbols(req) -> Dict[str, Any]:
-    """選股器：台股/美股收盤後不變，直接用資料庫快取；Crypto 則即時抓取"""
+    """選股器：僅篩選 DB 快取，不在請求內掃描交易所 / Yahoo。"""
     market = str(req.market).upper()
-    pool = getattr(req, "pool", "TOP100")
     source = "cache"
 
     def _from_cache():
         return get_cached_results(market, 5000)
 
-    def _live_fetch():
-        symbols = get_crypto_universe("ALL")
-        return run_parallel(symbols, process_crypto_symbol)
-
-    base = []
-    if market in ("TW", "US"):
-        # 台股、美股：收盤後資料不變，直接用快取
-        base = _from_cache()
-    else:
-        # Crypto：24h 交易，即時抓取，失敗則用快取
-        try:
-            base = _live_fetch()
-            source = "live"
-        except Exception as e:
-            print("WARN filter crypto live fetch failed, using cache:", repr(e))
-            base = _from_cache()
-        if not base:
-            base = _from_cache()
-
+    base = _from_cache()
     filtered = [x for x in base if passes_filters(x, req)]
 
     # 以訊號分數由高到低排序

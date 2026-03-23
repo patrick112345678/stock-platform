@@ -1,29 +1,73 @@
 # app/services/market_service.py
+# 股票資料統一走 get_cached_stock_data（單一 yfinance history + 60s 快取），避免重複打 Yahoo。
 
 import math
 import os
-from datetime import datetime, timezone
 
+import pandas as pd
 import requests
-import yfinance as yf
 from fastapi import HTTPException
-
-from app.services.yfinance_client import get_yfinance_session
-from app.schemas.market import MarketCandleItem, MarketChartResponse
 from typing import List, Dict, Any, Optional, Literal
+
+from app.schemas.market import MarketCandleItem, MarketChartResponse
+from app.services.stock_data_service import get_cached_stock_data, get_cached_data
 from app.services.scanner_service import (
-    filter_symbols,
     get_crypto_kline_with_fallback,
-    get_leaderboard,
-    get_opportunities,
+    get_tw_universe,
+    get_us_universe,
+    get_crypto_universe,
 )
-# Bybit API 基本網址
+
 BYBIT_BASE_URL = "https://api.bybit.com"
 BINANCE_API_BASE = "https://api.binance.com/api/v3"
 REQUEST_HEADERS = {
     "User-Agent": "Mozilla/5.0 (compatible; StockPlatform/1.0)",
     "Accept": "application/json",
 }
+EXTERNAL_REQUEST_TIMEOUT = 5.0
+
+CMC_API_KEY = os.getenv("CMC_API_KEY")
+PoolSize = Literal["TOP100", "TOP800", "ALL"]
+
+
+def safe_float(value):
+    try:
+        if value is None:
+            return None
+        value = float(value)
+        if math.isnan(value):
+            return None
+        return value
+    except Exception:
+        return None
+
+
+def is_crypto_symbol(symbol: str) -> bool:
+    s = str(symbol).strip().upper()
+    return s.endswith("USDT")
+
+
+def normalize_stock_symbol(symbol: str) -> str:
+    s = str(symbol).strip().upper()
+    if s.isdigit():
+        return f"{s}.TW"
+    if s.endswith(".TW"):
+        return s
+    return s
+
+
+def normalize_crypto_symbol(symbol: str) -> str:
+    s = str(symbol).strip().upper()
+    if s.endswith("USDT"):
+        return s
+    return f"{s}USDT"
+
+
+def detect_stock_market(symbol: str) -> str:
+    s = str(symbol).strip().upper()
+    if s.isdigit() or s.endswith(".TW"):
+        return "TW"
+    return "US"
 
 
 def _parse_tw_mis_number(val) -> Optional[float]:
@@ -36,17 +80,13 @@ def _parse_tw_mis_number(val) -> Optional[float]:
 
 
 def fetch_tw_mis_snapshot(raw_symbol: str) -> Optional[Dict[str, Any]]:
-    """
-    台股即時（盤中）快照：證交所 MIS API，不依賴 Yahoo。
-    上市優先 tse_，上櫃再試 otc_。
-    """
     code = str(raw_symbol).replace(".TW", "").replace(".TWO", "").strip()
     if not code.isdigit():
         return None
     for prefix in ("tse", "otc"):
         url = f"https://mis.twse.com.tw/stock/api/getStockInfo.jsp?ex_ch={prefix}_{code}.tw"
         try:
-            r = requests.get(url, timeout=12, headers=REQUEST_HEADERS)
+            r = requests.get(url, timeout=EXTERNAL_REQUEST_TIMEOUT, headers=REQUEST_HEADERS)
             r.raise_for_status()
             j = r.json()
             arr = j.get("msgArray") or []
@@ -55,9 +95,7 @@ def fetch_tw_mis_snapshot(raw_symbol: str) -> Optional[Dict[str, Any]]:
             row = arr[0]
             z = _parse_tw_mis_number(row.get("z"))
             y = _parse_tw_mis_number(row.get("y"))
-            price = z
-            if price is None and y is not None:
-                price = y
+            price = z if z is not None else y
             if price is None:
                 continue
             name = row.get("nf") or row.get("n") or row.get("c")
@@ -71,81 +109,22 @@ def fetch_tw_mis_snapshot(raw_symbol: str) -> Optional[Dict[str, Any]]:
     return None
 
 
-# CoinMarketCap API Key（之後如果要抓 top100 可用）
-CMC_API_KEY = os.getenv("CMC_API_KEY")
-PoolSize = Literal["TOP100", "TOP800", "ALL"]
-
-def safe_float(value):
-    """安全轉 float，避免 None / NaN 造成錯誤"""
-    try:
-        if value is None:
-            return None
-        value = float(value)
-        if math.isnan(value):
-            return None
-        return value
-    except Exception:
-        return None
-
-
-def is_crypto_symbol(symbol: str) -> bool:
-    """判斷是否為 USDT 交易對，例如 BTCUSDT"""
-    s = str(symbol).strip().upper()
-    return s.endswith("USDT")
-
-
-def normalize_stock_symbol(symbol: str) -> str:
-    """股票代號標準化：2330 -> 2330.TW，美股原樣保留"""
-    s = str(symbol).strip().upper()
-
-    if s.isdigit():
-        return f"{s}.TW"
-
-    if s.endswith(".TW"):
-        return s
-
-    return s
-
-
-def normalize_crypto_symbol(symbol: str) -> str:
-    """Crypto 代號標準化：BTC -> BTCUSDT"""
-    s = str(symbol).strip().upper()
-
-    if s.endswith("USDT"):
-        return s
-
-    return f"{s}USDT"
-
-
-def detect_stock_market(symbol: str) -> str:
-    """判斷股票市場，台股回 TW，其餘預設 US"""
-    s = str(symbol).strip().upper()
-    if s.isdigit() or s.endswith(".TW"):
-        return "TW"
-    return "US"
-
-
 def get_bybit_spot_symbols():
-    """取得 Bybit 現貨交易對清單"""
     url = f"{BYBIT_BASE_URL}/v5/market/instruments-info"
     params = {"category": "spot"}
-
-    resp = requests.get(url, params=params, timeout=10, headers=REQUEST_HEADERS)
+    resp = requests.get(url, params=params, timeout=EXTERNAL_REQUEST_TIMEOUT, headers=REQUEST_HEADERS)
     resp.raise_for_status()
     data = resp.json()
-
     if data.get("retCode") != 0:
         raise HTTPException(status_code=500, detail="取得 Bybit 幣種清單失敗")
-
     return data.get("result", {}).get("list", [])
 
 
 def _binance_ticker_row(symbol: str) -> dict:
-    """Binance 24h ticker，欄位對齊 Bybit ticker 以利 build_crypto_quote_data"""
     r = requests.get(
         f"{BINANCE_API_BASE}/ticker/24hr",
         params={"symbol": symbol},
-        timeout=10,
+        timeout=EXTERNAL_REQUEST_TIMEOUT,
         headers=REQUEST_HEADERS,
     )
     r.raise_for_status()
@@ -163,14 +142,10 @@ def _binance_ticker_row(symbol: str) -> dict:
 
 
 def get_ticker(symbol: str):
-    """先 Bybit，失敗則 Binance 現貨 24h"""
     url = f"{BYBIT_BASE_URL}/v5/market/tickers"
-    params = {
-        "category": "spot",
-        "symbol": symbol,
-    }
+    params = {"category": "spot", "symbol": symbol}
     try:
-        resp = requests.get(url, params=params, timeout=10, headers=REQUEST_HEADERS)
+        resp = requests.get(url, params=params, timeout=EXTERNAL_REQUEST_TIMEOUT, headers=REQUEST_HEADERS)
         resp.raise_for_status()
         data = resp.json()
         if data.get("retCode") != 0:
@@ -193,23 +168,30 @@ def get_ticker(symbol: str):
 
 
 def build_crypto_quote_data(symbol: str):
-    """建立 Crypto 報價資料（Bybit 失敗則 Binance）"""
     symbol = normalize_crypto_symbol(symbol)
-    item = dict(get_ticker(symbol))
+    try:
+        item = dict(get_ticker(symbol))
+    except Exception:
+        return {
+            "symbol": symbol,
+            "name": symbol,
+            "currency": "USDT",
+            "exchange": None,
+            "price": None,
+            "previous_close": None,
+            "change": None,
+            "change_percent": None,
+        }
     exch = item.pop("_exchange", "BYBIT")
-
     last_price = safe_float(item.get("lastPrice"))
     prev_price_24h = safe_float(item.get("prevPrice24h"))
     price_24h_pcnt = safe_float(item.get("price24hPcnt"))
-
     change = None
     if last_price is not None and prev_price_24h is not None:
         change = round(last_price - prev_price_24h, 8)
-
     change_percent = None
     if price_24h_pcnt is not None:
         change_percent = round(price_24h_pcnt * 100, 4)
-
     return {
         "symbol": symbol,
         "name": symbol,
@@ -220,41 +202,83 @@ def build_crypto_quote_data(symbol: str):
         "change": change,
         "change_percent": change_percent,
     }
-def safe_get_ticker_info(ticker):
-    try:
-        info = ticker.info
-        if not isinstance(info, dict):
-            return {}
-        return info
-    except Exception as e:
-        err = repr(e)
-        if any(
-            x in err
-            for x in ("401", "Unauthorized", "Invalid Crumb", "NoneType", "Forbidden")
-        ):
-            return {}
-        print("WARN ticker.info failed:", err)
-        return {}
 
 
-def safe_get_fast_info(ticker):
+def _slice_hist_by_period(hist: pd.DataFrame, period: str) -> pd.DataFrame:
+    days = {"1mo": 24, "3mo": 66, "6mo": 132, "1y": 252, "2y": 504}.get(period, 66)
+    if hist is None or hist.empty:
+        return hist
+    return hist.tail(days) if len(hist) > days else hist
+
+
+def _resample_to_4h(hist):
+    if hist is None or hist.empty or len(hist) < 2:
+        return hist
+    df = hist.copy()
     try:
-        fi = ticker.fast_info
-        if fi is None:
-            return {}
-        try:
-            return dict(fi)
-        except Exception:
-            return {}
-    except Exception as e:
-        err = repr(e)
-        if any(x in err for x in ("401", "Unauthorized", "Invalid Crumb", "NoneType")):
-            return {}
-        print("WARN ticker.fast_info failed:", err)
-        return {}
+        if hasattr(df.index, "tz") and df.index.tz is not None:
+            df = df.tz_convert(None)
+    except Exception:
+        pass
+    out = df.resample("4h").agg({
+        "Open": "first", "High": "max", "Low": "min",
+        "Close": "last", "Volume": "sum",
+    }).dropna(subset=["Close"])
+    return out
+
+
+def _resample_daily_to_weekly(hist: pd.DataFrame) -> pd.DataFrame:
+    if hist is None or hist.empty:
+        return hist
+    df = hist.copy()
+    try:
+        if hasattr(df.index, "tz") and df.index.tz is not None:
+            df = df.tz_convert(None)
+    except Exception:
+        pass
+    return df.resample("1W").agg({
+        "Open": "first", "High": "max", "Low": "min",
+        "Close": "last", "Volume": "sum",
+    }).dropna(subset=["Close"])
+
+
+def _resample_daily_to_4d(hist: pd.DataFrame) -> pd.DataFrame:
+    """日線不足時以 4 日棒近似 4h 級別趨勢（僅供 UI，非真實盤中 4h）。"""
+    if hist is None or hist.empty:
+        return hist
+    df = hist.copy()
+    try:
+        if hasattr(df.index, "tz") and df.index.tz is not None:
+            df = df.tz_convert(None)
+    except Exception:
+        pass
+    return df.resample("4D").agg({
+        "Open": "first", "High": "max", "Low": "min",
+        "Close": "last", "Volume": "sum",
+    }).dropna(subset=["Close"])
+
+
+def _add_technical_columns(hist: pd.DataFrame) -> pd.DataFrame:
+    if hist is None or hist.empty:
+        return hist
+    h = hist.copy()
+    h["MA20"] = h["Close"].rolling(20).mean()
+    h["MA60"] = h["Close"].rolling(60).mean()
+    delta = h["Close"].diff()
+    gain = delta.clip(lower=0)
+    loss = -delta.clip(upper=0)
+    avg_gain = gain.rolling(14).mean()
+    avg_loss = loss.rolling(14).mean()
+    rs = avg_gain / avg_loss.replace(0, math.nan)
+    h["RSI"] = 100 - (100 / (1 + rs))
+    ema12 = h["Close"].ewm(span=12, adjust=False).mean()
+    ema26 = h["Close"].ewm(span=26, adjust=False).mean()
+    h["MACD"] = ema12 - ema26
+    h["MACD_SIGNAL"] = h["MACD"].ewm(span=9, adjust=False).mean()
+    return h
+
 
 def get_quote_data(symbol: str, market: str = "stock"):
-    """統一取得股票或 crypto 報價資料"""
     raw_symbol = str(symbol).strip().upper()
     market = str(market).strip().lower()
 
@@ -262,62 +286,44 @@ def get_quote_data(symbol: str, market: str = "stock"):
         return build_crypto_quote_data(raw_symbol)
 
     stock_symbol = normalize_stock_symbol(raw_symbol)
-    sess = get_yfinance_session()
+    bundle = get_cached_data(stock_symbol)
+    hist = bundle.get("hist") if bundle.get("ok") else None
 
-    ticker = yf.Ticker(stock_symbol, session=sess)
-    # 優先 fast_info：Yahoo 封鎖 ticker.info 時，fast_info / history 仍常有資料
-    fast_info = safe_get_fast_info(ticker)
-    info = safe_get_ticker_info(ticker)
+    current_price = None
+    previous_close = None
+    if hist is not None and not hist.empty and "Close" in hist.columns:
+        cs = hist["Close"].dropna()
+        if len(cs) >= 1:
+            current_price = safe_float(cs.iloc[-1])
+        if len(cs) >= 2:
+            previous_close = safe_float(cs.iloc[-2])
+        elif len(cs) == 1:
+            previous_close = current_price
 
-    current_price = safe_float(
-        fast_info.get("last_price")
-        or fast_info.get("lastPrice")
-        or info.get("currentPrice")
-        or info.get("regularMarketPrice")
-        or info.get("previousClose")
-    )
-    previous_close = safe_float(
-        fast_info.get("previous_close")
-        or fast_info.get("previousClose")
-        or info.get("previousClose")
-        or info.get("regularMarketPreviousClose")
-    )
-
-    if current_price is None or previous_close is None:
-        try:
-            hist = ticker.history(period="5d", interval="1d", auto_adjust=False)
-        except Exception:
-            hist = None
-
-        if hist is not None and not hist.empty:
-            close_series = hist["Close"].dropna()
-
-            if current_price is None and len(close_series) >= 1:
-                current_price = safe_float(close_series.iloc[-1])
-
-            if previous_close is None:
-                if len(close_series) >= 2:
-                    previous_close = safe_float(close_series.iloc[-2])
-                elif len(close_series) == 1:
-                    previous_close = safe_float(close_series.iloc[-1])
-
-    tw_snap: Optional[Dict[str, Any]] = None
+    tw_name = None
     if stock_symbol.endswith(".TW"):
-        need_mis = current_price is None or not (
-            info.get("shortName")
-            or info.get("longName")
-            or fast_info.get("shortName")
-            or fast_info.get("longName")
-        )
-        if need_mis:
-            tw_snap = fetch_tw_mis_snapshot(stock_symbol)
-        if current_price is None and tw_snap:
-            current_price = safe_float(tw_snap.get("price"))
-            if previous_close is None:
-                previous_close = safe_float(tw_snap.get("previous_close"))
+        try:
+            snap = fetch_tw_mis_snapshot(stock_symbol)
+            if snap:
+                if current_price is None:
+                    current_price = safe_float(snap.get("price"))
+                if previous_close is None:
+                    previous_close = safe_float(snap.get("previous_close"))
+                tw_name = snap.get("name")
+        except Exception:
+            pass
 
     if current_price is None:
-        raise HTTPException(status_code=404, detail=f"查無商品或無法取得報價: {stock_symbol}")
+        return {
+            "symbol": stock_symbol,
+            "name": tw_name or stock_symbol,
+            "currency": "TWD" if stock_symbol.endswith(".TW") else None,
+            "exchange": None,
+            "price": 0.0,
+            "previous_close": previous_close,
+            "change": None,
+            "change_percent": None,
+        }
 
     change = None
     change_percent = None
@@ -325,17 +331,11 @@ def get_quote_data(symbol: str, market: str = "stock"):
         change = round(current_price - previous_close, 4)
         change_percent = round((change / previous_close) * 100, 4)
 
-    tw_name = (tw_snap or {}).get("name") if tw_snap else None
-
     return {
         "symbol": stock_symbol,
-        "name": tw_name
-        or info.get("shortName")
-        or info.get("longName")
-        or fast_info.get("shortName")
-        or fast_info.get("longName"),
-        "currency": info.get("currency") or ("TWD" if stock_symbol.endswith(".TW") else None),
-        "exchange": info.get("fullExchangeName") or info.get("exchange"),
+        "name": tw_name or stock_symbol,
+        "currency": "TWD" if stock_symbol.endswith(".TW") else None,
+        "exchange": None,
         "price": round(current_price, 4),
         "previous_close": round(previous_close, 4) if previous_close is not None else None,
         "change": change,
@@ -344,7 +344,6 @@ def get_quote_data(symbol: str, market: str = "stock"):
 
 
 def get_detail_data(symbol: str, market: str = "stock"):
-    """取得股票或 crypto 的詳細資料（52週、市值、產業、基本面等）"""
     raw_symbol = str(symbol).strip().upper()
     market = str(market).strip().lower()
 
@@ -381,42 +380,40 @@ def get_detail_data(symbol: str, market: str = "stock"):
         }
 
     stock_symbol = normalize_stock_symbol(raw_symbol)
-    ticker = yf.Ticker(stock_symbol, session=get_yfinance_session())
-    info = safe_get_ticker_info(ticker)
+    bundle = get_cached_data(stock_symbol)
+    hist = bundle.get("hist") if bundle.get("ok") else None
 
     quote = get_quote_data(symbol, market)
     market_label = "台股/櫃買" if stock_symbol.endswith((".TW", ".TWO")) or raw_symbol.isdigit() else "海外/其他"
-    sector = info.get("sector") or "N/A"
-    industry = info.get("industry") or info.get("sector") or "N/A"
 
-    # 資料品質
-    quality = "完整"
-    if not info.get("trailingPE") and not info.get("priceToBook"):
+    hi = safe_float(hist["High"].max()) if hist is not None and not hist.empty and "High" in hist.columns else None
+    lo = safe_float(hist["Low"].min()) if hist is not None and not hist.empty and "Low" in hist.columns else None
+
+    quality = "基本"
+    if hi is not None and lo is not None:
         quality = "部分"
-    if not info.get("trailingPE") and not info.get("priceToBook") and not info.get("trailingEps"):
-        quality = "基本"
 
     return {
         "symbol": stock_symbol,
         "raw_symbol": raw_symbol,
-        "name": quote.get("name") or info.get("symbol"),
+        "name": quote.get("name") or stock_symbol,
         "market": market_label,
-        "industry": industry,
-        "sector": sector,
-        "display_industry": industry if industry != "N/A" else sector,
+        "industry": "N/A",
+        "sector": "N/A",
+        "display_industry": "N/A",
         "price": quote.get("price"),
         "change": quote.get("change"),
         "change_percent": quote.get("change_percent"),
-        "market_cap": safe_float(info.get("marketCap")),
-        "fifty_two_week_high": safe_float(info.get("fiftyTwoWeekHigh")),
-        "fifty_two_week_low": safe_float(info.get("fiftyTwoWeekLow")),
-        "pe": safe_float(info.get("trailingPE")),
-        "pb": safe_float(info.get("priceToBook")),
-        "eps": safe_float(info.get("trailingEps")),
-        "roe": safe_float(info.get("returnOnEquity")),
-        "gross": safe_float(info.get("grossMargins")),
-        "revenue": safe_float(info.get("revenueGrowth")),
-        "debt": safe_float(info.get("debtToEquity")),
+        "market_cap": None,
+        "fifty_two_week_high": hi,
+        "fifty_two_week_low": lo,
+        "pe": None,
+        "pb": None,
+        "eps": None,
+        "roe": None,
+        "gross": None,
+        "revenue": None,
+        "debt": None,
         "valuation": None,
         "currency": quote.get("currency"),
         "exchange": quote.get("exchange"),
@@ -429,16 +426,13 @@ def get_detail_data(symbol: str, market: str = "stock"):
 
 
 def get_peer_symbols(symbol: str, market: str, max_peers: int = 5) -> List[str]:
-    """取得同業代號（簡化版：同市場優先）"""
-    from app.services.scanner_service import get_tw_universe, get_us_universe
-
     raw = str(symbol).strip().upper()
     mkt = str(market).strip().upper()
 
     if mkt == "TW":
-        universe = get_tw_universe("ALL")
+        universe = get_tw_universe("TOP30")
     elif mkt == "US":
-        universe = get_us_universe("ALL")
+        universe = get_us_universe("TOP30")
     else:
         return []
 
@@ -449,40 +443,21 @@ def get_peer_symbols(symbol: str, market: str, max_peers: int = 5) -> List[str]:
 
 
 def map_chart_interval_to_bybit(interval: str) -> str:
-    """把 chart interval 轉成 Bybit 格式"""
     mapping = {
-        "1m": "1",
-        "3m": "3",
-        "5m": "5",
-        "15m": "15",
-        "30m": "30",
-        "1h": "60",
-        "2h": "120",
-        "4h": "240",
-        "6h": "360",
-        "12h": "720",
-        "1d": "D",
-        "1w": "W",
-        "1wk": "W",
-        "1mo": "M",
+        "1m": "1", "3m": "3", "5m": "5", "15m": "15", "30m": "30",
+        "1h": "60", "2h": "120", "4h": "240", "6h": "360", "12h": "720",
+        "1d": "D", "1w": "W", "1wk": "W", "1mo": "M",
     }
     return mapping.get(interval, "D")
 
 
 def build_crypto_chart_data(symbol: str, interval: str, period: str):
-    """建立 Crypto K 線資料（Bybit 失敗則 Binance）"""
-    import pandas as pd
-
     symbol = normalize_crypto_symbol(symbol)
     bybit_interval = map_chart_interval_to_bybit(interval)
-
     try:
         df, _exch = get_crypto_kline_with_fallback(symbol, bybit_interval, 200)
-    except Exception as e:
-        raise HTTPException(
-            status_code=404,
-            detail=f"無法取得 Crypto 圖表: {symbol} ({e!r})",
-        ) from e
+    except Exception:
+        return MarketChartResponse(symbol=symbol, interval=interval, period=period, candles=[])
 
     candles = []
     for idx, row in df.iterrows():
@@ -492,16 +467,13 @@ def build_crypto_chart_data(symbol: str, interval: str, period: str):
         else:
             t = t.tz_convert("UTC")
         time_str = t.isoformat()
-
         open_price = safe_float(row.get("Open"))
         high_price = safe_float(row.get("High"))
         low_price = safe_float(row.get("Low"))
         close_price = safe_float(row.get("Close"))
         volume = safe_float(row.get("Volume"))
-
         if None in (open_price, high_price, low_price, close_price):
             continue
-
         candles.append(
             MarketCandleItem(
                 time=time_str,
@@ -512,62 +484,40 @@ def build_crypto_chart_data(symbol: str, interval: str, period: str):
                 volume=volume,
             )
         )
+    return MarketChartResponse(symbol=symbol, interval=interval, period=period, candles=candles)
 
-    return MarketChartResponse(
-        symbol=symbol,
-        interval=interval,
-        period=period,
-        candles=candles,
-    )
+
 def build_crypto_market_data(symbol: str, interval: str = "1d") -> dict:
-    """提供 AI 分析用的 Crypto 資料（Bybit 失敗則 Binance）"""
-    import pandas as pd
-
     symbol = normalize_crypto_symbol(symbol)
     bybit_interval = map_chart_interval_to_bybit(interval)
-
     try:
         df, _exch = get_crypto_kline_with_fallback(symbol, bybit_interval, 200)
-    except Exception as e:
-        raise HTTPException(
-            status_code=404,
-            detail=f"無法取得 Crypto 可分析資料: {symbol} ({e!r})",
-        ) from e
-
+    except Exception:
+        return {
+            "raw_symbol": symbol,
+            "name": symbol,
+            "market": "CRYPTO",
+            "price": None,
+            "support": None,
+            "resistance": None,
+            "hist": pd.DataFrame(),
+        }
     df = df.reset_index(drop=True)
-
     if df.empty:
-        raise HTTPException(status_code=404, detail=f"查無有效可分析資料: {symbol}")
-
-    # MA20
-    df["MA20"] = df["Close"].rolling(20).mean()
-
-    # MA60
-    df["MA60"] = df["Close"].rolling(60).mean()
-
-    # RSI
-    delta = df["Close"].diff()
-    gain = delta.clip(lower=0)
-    loss = -delta.clip(upper=0)
-
-    avg_gain = gain.rolling(14).mean()
-    avg_loss = loss.rolling(14).mean()
-
-    rs = avg_gain / avg_loss
-    df["RSI"] = 100 - (100 / (1 + rs))
-
-    # MACD
-    ema12 = df["Close"].ewm(span=12, adjust=False).mean()
-    ema26 = df["Close"].ewm(span=26, adjust=False).mean()
-    df["MACD"] = ema12 - ema26
-    df["MACD_SIGNAL"] = df["MACD"].ewm(span=9, adjust=False).mean()
-
+        return {
+            "raw_symbol": symbol,
+            "name": symbol,
+            "market": "CRYPTO",
+            "price": None,
+            "support": None,
+            "resistance": None,
+            "hist": pd.DataFrame(),
+        }
+    df = _add_technical_columns(df)
     latest_close = safe_float(df["Close"].iloc[-1])
-
     recent = df.tail(20)
     support = safe_float(recent["Low"].min()) if not recent.empty else None
     resistance = safe_float(recent["High"].max()) if not recent.empty else None
-
     return {
         "raw_symbol": symbol,
         "name": symbol,
@@ -575,47 +525,35 @@ def build_crypto_market_data(symbol: str, interval: str = "1d") -> dict:
         "price": latest_close,
         "support": support,
         "resistance": resistance,
+        "pe": None,
+        "pb": None,
         "hist": df,
     }
 
-def _resample_to_4h(hist):
-    """將 1h K 線重採樣為 4h（參考 v14）"""
-    if hist is None or hist.empty or len(hist) < 2:
-        return hist
-    df = hist.copy()
-    try:
-        if hasattr(df.index, "tz") and df.index.tz is not None:
-            df = df.tz_convert(None)
-    except Exception:
-        pass
-    out = df.resample("4h").agg({
-        "Open": "first", "High": "max", "Low": "min",
-        "Close": "last", "Volume": "sum",
-    }).dropna(subset=["Close"])
-    return out
-
 
 def get_chart_data(symbol: str, interval: str, period: str):
-    """統一取得股票 / Crypto K 線（支援 1h, 4h, 1d, 1wk）"""
     raw_symbol = str(symbol).strip().upper()
-
     if is_crypto_symbol(raw_symbol):
         return build_crypto_chart_data(raw_symbol, interval, period)
 
-    symbol = normalize_stock_symbol(raw_symbol)
-    ticker = yf.Ticker(symbol, session=get_yfinance_session())
+    sym = normalize_stock_symbol(raw_symbol)
+    bundle = get_cached_data(sym)
+    hist = bundle.get("hist") if bundle.get("ok") else None
+    if hist is None or hist.empty:
+        return MarketChartResponse(symbol=sym, interval=interval, period=period, candles=[])
+
+    hist = _slice_hist_by_period(hist, period)
+
     if interval == "4h":
-        hist = ticker.history(period="2mo", interval="1h", auto_adjust=False)
-        if hist is not None and not hist.empty:
-            hist = _resample_to_4h(hist)
-        if hist is None or hist.empty:
-            raise HTTPException(status_code=404, detail=f"查無 4h 圖表資料: {symbol}")
-    else:
-        _period = "1mo" if interval == "1h" else ("2y" if interval == "1wk" else period)
-        hist = ticker.history(period=_period, interval=interval, auto_adjust=False)
+        # 僅使用快取日線衍生，不再額外呼叫 yfinance（避免 rate limit）
+        hist = _resample_daily_to_4d(hist)
+    elif interval == "1wk":
+        hist = _resample_daily_to_weekly(hist)
+    elif interval == "1h":
+        hist = hist.tail(30)
 
     if hist is None or hist.empty:
-        raise HTTPException(status_code=404, detail=f"查無圖表資料: {symbol}")
+        return MarketChartResponse(symbol=sym, interval=interval, period=period, candles=[])
 
     candles = []
     for idx, row in hist.iterrows():
@@ -624,12 +562,9 @@ def get_chart_data(symbol: str, interval: str, period: str):
         low_price = safe_float(row.get("Low"))
         close_price = safe_float(row.get("Close"))
         volume = safe_float(row.get("Volume"))
-
         if None in (open_price, high_price, low_price, close_price):
             continue
-
         time_str = idx.isoformat() if hasattr(idx, "isoformat") else str(idx)
-
         candles.append(
             MarketCandleItem(
                 time=time_str,
@@ -640,20 +575,10 @@ def get_chart_data(symbol: str, interval: str, period: str):
                 volume=volume,
             )
         )
-
-    if not candles:
-        raise HTTPException(status_code=404, detail=f"查無有效K線資料: {symbol}")
-
-    return MarketChartResponse(
-        symbol=symbol,
-        interval=interval,
-        period=period,
-        candles=candles,
-    )
+    return MarketChartResponse(symbol=sym, interval=interval, period=period, candles=candles)
 
 
 def get_market_data(symbol: str, market: str = "US", interval: str = "1d", period: str | None = None) -> dict:
-    """提供 AI 分析用的單一標的資料"""
     raw_symbol = str(symbol).strip().upper()
     market_upper = str(market).strip().upper()
 
@@ -665,78 +590,75 @@ def get_market_data(symbol: str, market: str = "US", interval: str = "1d", perio
     else:
         yf_symbol = raw_symbol
 
-    ticker = yf.Ticker(yf_symbol, session=get_yfinance_session())
-    info = safe_get_ticker_info(ticker)
-    # 估值用（yfinance 欄位可能缺漏，若取不到會是 None）
-    pe = safe_float(info.get("trailingPE") or info.get("forwardPE"))
-    pb = safe_float(info.get("priceToBook"))
-    if interval == "4h":
-        hist_1h = ticker.history(period="2mo", interval="1h", auto_adjust=False)
-        if hist_1h is None or hist_1h.empty or len(hist_1h) < 2:
-            raise HTTPException(status_code=404, detail=f"查無可分析資料: {yf_symbol}")
-        hist_1h = hist_1h[~hist_1h.index.duplicated(keep="first")]
-        hist = hist_1h.resample("4h").agg({
-            "Open": "first", "High": "max", "Low": "min",
-            "Close": "last", "Volume": "sum"
-        }).dropna(subset=["Close"])
-        if hist.empty or len(hist) < 2:
-            raise HTTPException(status_code=404, detail=f"查無可分析資料: {yf_symbol}")
-    else:
-        _period = period or ("1mo" if interval == "1h" else ("2y" if interval == "1wk" else "6mo"))
-        hist = ticker.history(period=_period, interval=interval, auto_adjust=False)
+    bundle = get_cached_data(yf_symbol)
+    hist = bundle.get("hist") if bundle.get("ok") else None
 
     if hist is None or hist.empty:
-        raise HTTPException(status_code=404, detail=f"查無可分析資料: {yf_symbol}")
+        return {
+            "raw_symbol": raw_symbol,
+            "name": raw_symbol,
+            "market": market_upper,
+            "price": None,
+            "support": None,
+            "resistance": None,
+            "pe": None,
+            "pb": None,
+            "hist": pd.DataFrame(),
+        }
 
-    # MA20
-    hist["MA20"] = hist["Close"].rolling(20).mean()
+    if interval == "1d":
+        _period = period or "6mo"
+        hist = _slice_hist_by_period(hist, _period if _period in ("1mo", "3mo", "6mo", "1y", "2y") else "6mo")
+    elif interval == "1wk":
+        hist = _slice_hist_by_period(hist, "2y")
+        hist = _resample_daily_to_weekly(hist)
+    elif interval == "4h":
+        hist = _slice_hist_by_period(hist, "3mo")
+        hist = _resample_daily_to_4d(hist)
+    elif interval == "1h":
+        hist = hist.tail(40)
+    else:
+        hist = _slice_hist_by_period(hist, "6mo")
 
-    # MA60
-    hist["MA60"] = hist["Close"].rolling(60).mean()
+    hist = _add_technical_columns(hist)
 
-    # RSI
-    delta = hist["Close"].diff()
-    gain = delta.clip(lower=0)
-    loss = -delta.clip(upper=0)
-
-    avg_gain = gain.rolling(14).mean()
-    avg_loss = loss.rolling(14).mean()
-
-    rs = avg_gain / avg_loss
-    hist["RSI"] = 100 - (100 / (1 + rs))
-
-    # MACD
-    ema12 = hist["Close"].ewm(span=12, adjust=False).mean()
-    ema26 = hist["Close"].ewm(span=26, adjust=False).mean()
-    hist["MACD"] = ema12 - ema26
-    hist["MACD_SIGNAL"] = hist["MACD"].ewm(span=9, adjust=False).mean()
+    if hist is None or hist.empty:
+        return {
+            "raw_symbol": raw_symbol,
+            "name": raw_symbol,
+            "market": market_upper,
+            "price": None,
+            "support": None,
+            "resistance": None,
+            "pe": None,
+            "pb": None,
+            "hist": pd.DataFrame(),
+        }
 
     latest_close = safe_float(hist["Close"].iloc[-1])
-
     recent = hist.tail(20)
     support = safe_float(recent["Low"].min()) if not recent.empty else None
     resistance = safe_float(recent["High"].max()) if not recent.empty else None
 
     return {
         "raw_symbol": raw_symbol,
-        "name": info.get("shortName") or info.get("longName") or raw_symbol,
+        "name": raw_symbol,
         "market": market_upper,
         "price": latest_close,
         "support": support,
         "resistance": resistance,
-        "pe": pe,
-        "pb": pb,
+        "pe": None,
+        "pb": None,
         "hist": hist,
     }
 
 
 def get_multi_timeframe_summary(symbol: str, market: str = "US", lang: str = "zh") -> List[Dict[str, Any]]:
-    """多時間框架總覽：1h, 1d, 1wk 的趨勢、價格、RSI、訊號分數"""
     from app.services.technical_service import trend_score, trend_label
 
     intervals = [("1h", "1mo"), ("4h", "2mo"), ("1d", "6mo"), ("1wk", "2y")]
     rows = []
-    for iv, period in intervals:
+    for iv, _per in intervals:
         try:
             data = get_market_data(symbol=symbol, market=market, interval=iv)
             if data.get("hist") is None or data["hist"].empty:
@@ -760,7 +682,6 @@ def get_multi_timeframe_summary(symbol: str, market: str = "US", lang: str = "zh
 
 
 def get_technical_signal_table(symbol: str, market: str = "US", lang: str = "zh") -> List[Dict[str, str]]:
-    """技術訊號總表：均線、RSI、MACD、關鍵價位、成交量、型態"""
     from app.services.technical_service import generate_signal_table
 
     data = get_market_data(symbol=symbol, market=market, interval="1d")
@@ -769,7 +690,10 @@ def get_technical_signal_table(symbol: str, market: str = "US", lang: str = "zh"
     resistance = data.get("resistance")
     if hist is None or hist.empty:
         return []
-    return generate_signal_table(hist, support, resistance, lang=lang)
+    try:
+        return generate_signal_table(hist, support, resistance, lang=lang)
+    except Exception:
+        return []
 
 
 def build_opportunity_candidates(
@@ -785,7 +709,7 @@ def build_opportunity_candidates(
     elif market_upper == "US":
         symbols = get_us_universe()
     elif market_upper == "CRYPTO":
-        symbols = get_crypto_universe(limit=max(limit * 3, 20))
+        symbols = get_crypto_universe()
     else:
         raise HTTPException(status_code=400, detail=f"不支援的 market: {market}")
 
@@ -797,17 +721,14 @@ def build_opportunity_candidates(
                 quote = build_crypto_quote_data(symbol)
                 price = safe_float(quote.get("price"))
                 change_pct = safe_float(quote.get("change_percent"))
-
                 score = 50
                 reasons = []
-
                 if change_pct is not None and change_pct > 0:
                     score += 10
                     reasons.append("24h 漲幅為正")
                 if change_pct is not None and change_pct >= 3:
                     score += 10
                     reasons.append("短線動能偏強")
-
                 results.append({
                     "symbol": quote["symbol"],
                     "name": quote.get("name") or quote["symbol"],
@@ -820,21 +741,19 @@ def build_opportunity_candidates(
 
             data = get_market_data(symbol=symbol, market=market_upper, interval="1d")
             hist = data["hist"]
+            if hist is None or hist.empty:
+                continue
             latest = hist.iloc[-1]
-
             price = safe_float(latest.get("Close"))
             ma20 = safe_float(latest.get("MA20"))
             ma60 = safe_float(latest.get("MA60"))
             rsi = safe_float(latest.get("RSI"))
-
             prev_close = safe_float(hist["Close"].iloc[-2]) if len(hist) >= 2 else None
             change_pct = None
             if price is not None and prev_close not in (None, 0):
                 change_pct = round(((price - prev_close) / prev_close) * 100, 4)
-
             score = 50
             reasons = []
-
             if price is not None and ma20 is not None and price > ma20:
                 score += 10
                 reasons.append("站上 MA20")
@@ -847,7 +766,6 @@ def build_opportunity_candidates(
             if change_pct is not None and change_pct > 0:
                 score += 5
                 reasons.append("日內漲幅為正")
-
             results.append({
                 "symbol": data["raw_symbol"],
                 "name": data["name"],
@@ -862,4 +780,3 @@ def build_opportunity_candidates(
 
     results.sort(key=lambda x: (x.get("score") or 0, x.get("change_pct") or 0), reverse=True)
     return results[:limit]
-   

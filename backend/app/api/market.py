@@ -20,7 +20,7 @@ from app.services.scanner_service import (
     get_tw_search_items,
     get_us_universe,
     get_us_search_items,
-    get_crypto_universe,
+    get_crypto_search_pool,
 )
 router = APIRouter(prefix="/market", tags=["market"])
 
@@ -51,10 +51,18 @@ def get_market_quote(
     try:
         data = get_quote_data(symbol, market)
         return MarketQuoteResponse(**data)
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"取得報價失敗: {str(e)}")
+    except Exception:
+        sym = str(symbol).strip().upper()
+        return MarketQuoteResponse(
+            symbol=sym,
+            name=sym,
+            currency=None,
+            exchange=None,
+            price=0.0,
+            previous_close=None,
+            change=None,
+            change_percent=None,
+        )
 
 
 @router.get("/overview", response_model=MarketOverviewResponse)
@@ -107,10 +115,8 @@ def get_market_chart(
 ):
     try:
         return get_chart_data(symbol=symbol, interval=interval, period=period)
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"取得 chart 失敗: {str(e)}")
+    except Exception:
+        return MarketChartResponse(symbol=str(symbol).strip().upper(), interval=interval, period=period, candles=[])
 
 
 @router.get("/multi-timeframe")
@@ -153,10 +159,38 @@ def get_market_detail(
     """取得標的詳細資料：52週、市值、產業、基本面等"""
     try:
         return get_detail_data(symbol, market)
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"取得詳細資料失敗: {str(e)}")
+    except Exception:
+        sym = str(symbol).strip().upper()
+        return {
+            "symbol": sym,
+            "raw_symbol": sym,
+            "name": sym,
+            "market": market,
+            "industry": "N/A",
+            "sector": "N/A",
+            "display_industry": "N/A",
+            "price": None,
+            "change": None,
+            "change_percent": None,
+            "market_cap": None,
+            "fifty_two_week_high": None,
+            "fifty_two_week_low": None,
+            "pe": None,
+            "pb": None,
+            "eps": None,
+            "roe": None,
+            "gross": None,
+            "revenue": None,
+            "debt": None,
+            "valuation": None,
+            "currency": None,
+            "exchange": None,
+            "interval": "1d",
+            "fetch_interval": "1d",
+            "period": "3mo",
+            "data_quality": "無資料",
+            "errors": [],
+        }
 
 
 @router.get("/peers")
@@ -227,7 +261,7 @@ def search_market(
                     append_search_item(raw_symbol, name, "US", "US")
 
         if market in (None, "", "CRYPTO"):
-            crypto_items = get_crypto_universe("ALL")[:800]
+            crypto_items = get_crypto_search_pool(limit=80)
 
             for item in crypto_items:
                 if isinstance(item, str):

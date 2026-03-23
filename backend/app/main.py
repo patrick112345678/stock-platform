@@ -15,9 +15,8 @@ from app.api.ai import router as ai_router
 from app.api.scanner import router as scanner_router
 from app.api.payment import router as payment_router
 
-# 👇 新增
+# 👇 背景掃描
 import asyncio
-from app.services.ai_service import AIService
 from app.services.scanner_service import (
     get_us_universe,
     get_tw_universe,
@@ -146,7 +145,7 @@ async def scanner_cache_10min_job():
         await asyncio.sleep(600)  # 每 10 分鐘更新一次
 
 
-# 👇 啟動時自動跑
+# 👇 啟動時自動跑背景掃描與快取更新
 @app.on_event("startup")
 async def startup_event():
     asyncio.create_task(scanner_background_job())
