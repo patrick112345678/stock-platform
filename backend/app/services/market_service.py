@@ -8,6 +8,7 @@ import requests
 import yfinance as yf
 from fastapi import HTTPException
 
+from app.services.yfinance_client import get_yfinance_session
 from app.schemas.market import MarketCandleItem, MarketChartResponse
 from typing import List, Dict, Any, Optional, Literal
 from app.services.scanner_service import (
@@ -23,6 +24,52 @@ REQUEST_HEADERS = {
     "User-Agent": "Mozilla/5.0 (compatible; StockPlatform/1.0)",
     "Accept": "application/json",
 }
+
+
+def _parse_tw_mis_number(val) -> Optional[float]:
+    if val is None or val == "" or val == "-":
+        return None
+    try:
+        return float(str(val).replace(",", ""))
+    except (TypeError, ValueError):
+        return None
+
+
+def fetch_tw_mis_snapshot(raw_symbol: str) -> Optional[Dict[str, Any]]:
+    """
+    台股即時（盤中）快照：證交所 MIS API，不依賴 Yahoo。
+    上市優先 tse_，上櫃再試 otc_。
+    """
+    code = str(raw_symbol).replace(".TW", "").replace(".TWO", "").strip()
+    if not code.isdigit():
+        return None
+    for prefix in ("tse", "otc"):
+        url = f"https://mis.twse.com.tw/stock/api/getStockInfo.jsp?ex_ch={prefix}_{code}.tw"
+        try:
+            r = requests.get(url, timeout=12, headers=REQUEST_HEADERS)
+            r.raise_for_status()
+            j = r.json()
+            arr = j.get("msgArray") or []
+            if not arr:
+                continue
+            row = arr[0]
+            z = _parse_tw_mis_number(row.get("z"))
+            y = _parse_tw_mis_number(row.get("y"))
+            price = z
+            if price is None and y is not None:
+                price = y
+            if price is None:
+                continue
+            name = row.get("nf") or row.get("n") or row.get("c")
+            return {
+                "price": price,
+                "previous_close": y,
+                "name": str(name).strip() if name else None,
+            }
+        except Exception:
+            continue
+    return None
+
 
 # CoinMarketCap API Key（之後如果要抓 top100 可用）
 CMC_API_KEY = os.getenv("CMC_API_KEY")
@@ -176,17 +223,34 @@ def build_crypto_quote_data(symbol: str):
 def safe_get_ticker_info(ticker):
     try:
         info = ticker.info
-        return info or {}
+        if not isinstance(info, dict):
+            return {}
+        return info
     except Exception as e:
-        print("WARN ticker.info failed:", repr(e))
+        err = repr(e)
+        if any(
+            x in err
+            for x in ("401", "Unauthorized", "Invalid Crumb", "NoneType", "Forbidden")
+        ):
+            return {}
+        print("WARN ticker.info failed:", err)
         return {}
+
 
 def safe_get_fast_info(ticker):
     try:
         fi = ticker.fast_info
-        return dict(fi) if fi else {}
+        if fi is None:
+            return {}
+        try:
+            return dict(fi)
+        except Exception:
+            return {}
     except Exception as e:
-        print("WARN ticker.fast_info failed:", repr(e))
+        err = repr(e)
+        if any(x in err for x in ("401", "Unauthorized", "Invalid Crumb", "NoneType")):
+            return {}
+        print("WARN ticker.fast_info failed:", err)
         return {}
 
 def get_quote_data(symbol: str, market: str = "stock"):
@@ -198,23 +262,32 @@ def get_quote_data(symbol: str, market: str = "stock"):
         return build_crypto_quote_data(raw_symbol)
 
     stock_symbol = normalize_stock_symbol(raw_symbol)
+    sess = get_yfinance_session()
 
-    ticker = yf.Ticker(stock_symbol)
-    info = safe_get_ticker_info(ticker)
+    ticker = yf.Ticker(stock_symbol, session=sess)
+    # 優先 fast_info：Yahoo 封鎖 ticker.info 時，fast_info / history 仍常有資料
     fast_info = safe_get_fast_info(ticker)
+    info = safe_get_ticker_info(ticker)
 
     current_price = safe_float(
-        info.get("currentPrice")
+        fast_info.get("last_price")
+        or fast_info.get("lastPrice")
+        or info.get("currentPrice")
         or info.get("regularMarketPrice")
         or info.get("previousClose")
     )
     previous_close = safe_float(
-        info.get("previousClose")
+        fast_info.get("previous_close")
+        or fast_info.get("previousClose")
+        or info.get("previousClose")
         or info.get("regularMarketPreviousClose")
     )
 
     if current_price is None or previous_close is None:
-        hist = ticker.history(period="5d", interval="1d", auto_adjust=False)
+        try:
+            hist = ticker.history(period="5d", interval="1d", auto_adjust=False)
+        except Exception:
+            hist = None
 
         if hist is not None and not hist.empty:
             close_series = hist["Close"].dropna()
@@ -228,6 +301,21 @@ def get_quote_data(symbol: str, market: str = "stock"):
                 elif len(close_series) == 1:
                     previous_close = safe_float(close_series.iloc[-1])
 
+    tw_snap: Optional[Dict[str, Any]] = None
+    if stock_symbol.endswith(".TW"):
+        need_mis = current_price is None or not (
+            info.get("shortName")
+            or info.get("longName")
+            or fast_info.get("shortName")
+            or fast_info.get("longName")
+        )
+        if need_mis:
+            tw_snap = fetch_tw_mis_snapshot(stock_symbol)
+        if current_price is None and tw_snap:
+            current_price = safe_float(tw_snap.get("price"))
+            if previous_close is None:
+                previous_close = safe_float(tw_snap.get("previous_close"))
+
     if current_price is None:
         raise HTTPException(status_code=404, detail=f"查無商品或無法取得報價: {stock_symbol}")
 
@@ -237,10 +325,16 @@ def get_quote_data(symbol: str, market: str = "stock"):
         change = round(current_price - previous_close, 4)
         change_percent = round((change / previous_close) * 100, 4)
 
+    tw_name = (tw_snap or {}).get("name") if tw_snap else None
+
     return {
         "symbol": stock_symbol,
-        "name": info.get("shortName") or info.get("longName"),
-        "currency": info.get("currency"),
+        "name": tw_name
+        or info.get("shortName")
+        or info.get("longName")
+        or fast_info.get("shortName")
+        or fast_info.get("longName"),
+        "currency": info.get("currency") or ("TWD" if stock_symbol.endswith(".TW") else None),
         "exchange": info.get("fullExchangeName") or info.get("exchange"),
         "price": round(current_price, 4),
         "previous_close": round(previous_close, 4) if previous_close is not None else None,
@@ -287,7 +381,7 @@ def get_detail_data(symbol: str, market: str = "stock"):
         }
 
     stock_symbol = normalize_stock_symbol(raw_symbol)
-    ticker = yf.Ticker(stock_symbol)
+    ticker = yf.Ticker(stock_symbol, session=get_yfinance_session())
     info = safe_get_ticker_info(ticker)
 
     quote = get_quote_data(symbol, market)
@@ -509,7 +603,7 @@ def get_chart_data(symbol: str, interval: str, period: str):
         return build_crypto_chart_data(raw_symbol, interval, period)
 
     symbol = normalize_stock_symbol(raw_symbol)
-    ticker = yf.Ticker(symbol)
+    ticker = yf.Ticker(symbol, session=get_yfinance_session())
     if interval == "4h":
         hist = ticker.history(period="2mo", interval="1h", auto_adjust=False)
         if hist is not None and not hist.empty:
@@ -571,7 +665,7 @@ def get_market_data(symbol: str, market: str = "US", interval: str = "1d", perio
     else:
         yf_symbol = raw_symbol
 
-    ticker = yf.Ticker(yf_symbol)
+    ticker = yf.Ticker(yf_symbol, session=get_yfinance_session())
     info = safe_get_ticker_info(ticker)
     # 估值用（yfinance 欄位可能缺漏，若取不到會是 None）
     pe = safe_float(info.get("trailingPE") or info.get("forwardPE"))

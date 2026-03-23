@@ -14,7 +14,8 @@ pydantic[email]
 psycopg2-binary
 
 # ========== 專案功能 ==========
-yfinance>=1.0
+# 請維持較新版本，舊版在 Yahoo 改 API 後易 401 / Invalid Crumb
+yfinance>=0.2.48
 pandas
 lxml
 numpy

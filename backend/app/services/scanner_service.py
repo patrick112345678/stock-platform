@@ -6,6 +6,8 @@ from typing import List, Dict, Any
 import pandas as pd
 import requests
 import yfinance as yf
+
+from app.services.yfinance_client import get_yfinance_session
 from datetime import datetime, timedelta, time
 import json
 from app.db.database import SessionLocal
@@ -385,6 +387,7 @@ def get_stock_hist(symbol: str, period: str = "6mo", interval: str = "1d") -> pd
         auto_adjust=False,
         threads=False,
         group_by="column",
+        session=get_yfinance_session(),
     )
 
     if df is None or df.empty:
