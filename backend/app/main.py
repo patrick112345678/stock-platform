@@ -1,3 +1,6 @@
+import os
+from contextlib import asynccontextmanager
+
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, Response
 from sqlalchemy import text
@@ -29,7 +32,45 @@ from app.services.scanner_service import (
     is_scanner_cache_recent,
 )
 
-app = FastAPI()
+
+def _init_db_sync() -> None:
+    """於 lifespan 內以 thread 執行，避免阻塞 ASGI；勿在模組 import 時連線建表（Render 易 port scan timeout）。"""
+    Base.metadata.create_all(bind=engine)
+    ensure_users_plan_expires_column()
+
+
+async def _init_db_async() -> None:
+    """背景執行建表／遷移，避免阻塞 lifespan → 讓埠先綁定（Render port scan）。"""
+    try:
+        await asyncio.to_thread(_init_db_sync)
+        print("🟢 DB init (create_all / migrations) complete")
+    except Exception as e:
+        print("🔴 DB init failed:", e)
+
+
+async def _delayed_background_jobs() -> None:
+    """
+    延遲啟動背景掃描，讓 Uvicorn 先完成綁定與 Render 健康檢查。
+    若仍 OOM，可設 ENABLE_BACKGROUND_SCANNER=false
+    """
+    await asyncio.sleep(20)
+    if os.getenv("ENABLE_BACKGROUND_SCANNER", "true").lower() not in ("1", "true", "yes", "on"):
+        print("🟡 ENABLE_BACKGROUND_SCANNER 已關閉，跳過背景掃描任務")
+        return
+    asyncio.create_task(scanner_background_job())
+    asyncio.create_task(scanner_cache_10min_job())
+    print("🟢 background scanner tasks scheduled")
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # 勿在 yield 前 await 長時間 DB 作業，否則 Render 在「尚未 listen」時會 port scan timeout
+    asyncio.create_task(_init_db_async())
+    asyncio.create_task(_delayed_background_jobs())
+    yield
+
+
+app = FastAPI(lifespan=lifespan)
 
 
 @app.exception_handler(SQLAlchemyError)
@@ -54,10 +95,6 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
-# DB
-Base.metadata.create_all(bind=engine)
-ensure_users_plan_expires_column()
 
 # Routers
 app.include_router(auth_router)
@@ -145,11 +182,10 @@ async def scanner_cache_10min_job():
         await asyncio.sleep(600)  # 每 10 分鐘更新一次
 
 
-# 👇 啟動時自動跑背景掃描與快取更新
-@app.on_event("startup")
-async def startup_event():
-    asyncio.create_task(scanner_background_job())
-    asyncio.create_task(scanner_cache_10min_job())
+@app.get("/health")
+def health_live():
+    """Render / 負載平衡探活：不連資料庫、不做外部請求，盡快回 200。"""
+    return {"status": "ok", "service": "stock-platform-api"}
 
 
 @app.get("/")
