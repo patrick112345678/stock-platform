@@ -11,12 +11,14 @@ from fastapi import HTTPException
 from app.schemas.market import MarketCandleItem, MarketChartResponse
 from typing import List, Dict, Any, Optional, Literal
 from app.services.scanner_service import (
+    filter_symbols,
+    get_crypto_kline_with_fallback,
     get_leaderboard,
     get_opportunities,
-    filter_symbols,
 )
 # Bybit API 基本網址
 BYBIT_BASE_URL = "https://api.bybit.com"
+BINANCE_API_BASE = "https://api.binance.com/api/v3"
 
 # CoinMarketCap API Key（之後如果要抓 top100 可用）
 CMC_API_KEY = os.getenv("CMC_API_KEY")
@@ -87,32 +89,62 @@ def get_bybit_spot_symbols():
     return data.get("result", {}).get("list", [])
 
 
+def _binance_ticker_row(symbol: str) -> dict:
+    """Binance 24h ticker，欄位對齊 Bybit ticker 以利 build_crypto_quote_data"""
+    r = requests.get(
+        f"{BINANCE_API_BASE}/ticker/24hr",
+        params={"symbol": symbol},
+        timeout=10,
+    )
+    r.raise_for_status()
+    t = r.json()
+    lp = safe_float(t.get("lastPrice"))
+    op = safe_float(t.get("openPrice"))
+    pcp = safe_float(t.get("priceChangePercent"))
+    frac = (pcp / 100.0) if pcp is not None else None
+    return {
+        "lastPrice": str(lp) if lp is not None else None,
+        "prevPrice24h": str(op) if op is not None else None,
+        "price24hPcnt": str(frac) if frac is not None else None,
+        "_exchange": "BINANCE",
+    }
+
+
 def get_ticker(symbol: str):
-    """取得 Bybit 單一 ticker"""
+    """先 Bybit，失敗則 Binance 現貨 24h"""
     url = f"{BYBIT_BASE_URL}/v5/market/tickers"
     params = {
         "category": "spot",
-        "symbol": symbol
+        "symbol": symbol,
     }
-
-    resp = requests.get(url, params=params, timeout=10)
-    resp.raise_for_status()
-    data = resp.json()
-
-    if data.get("retCode") != 0:
-        raise HTTPException(status_code=404, detail=f"Bybit 查無商品: {symbol}")
-
-    items = data.get("result", {}).get("list", [])
-    if not items:
-        raise HTTPException(status_code=404, detail=f"Bybit 查無商品: {symbol}")
-
-    return items[0]
+    try:
+        resp = requests.get(url, params=params, timeout=10)
+        resp.raise_for_status()
+        data = resp.json()
+        if data.get("retCode") != 0:
+            raise ValueError(f"Bybit retCode: {data.get('retCode')}")
+        items = data.get("result", {}).get("list", [])
+        if not items:
+            raise ValueError("Bybit empty list")
+        row = dict(items[0])
+        row["_exchange"] = "BYBIT"
+        return row
+    except Exception as e:
+        print("WARN Bybit ticker failed, trying Binance:", symbol, repr(e))
+        try:
+            return _binance_ticker_row(symbol)
+        except Exception as e2:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Bybit 與 Binance 皆查無報價: {symbol} ({e2!r})",
+            ) from e2
 
 
 def build_crypto_quote_data(symbol: str):
-    """建立 Crypto 報價資料"""
+    """建立 Crypto 報價資料（Bybit 失敗則 Binance）"""
     symbol = normalize_crypto_symbol(symbol)
-    item = get_ticker(symbol)
+    item = dict(get_ticker(symbol))
+    exch = item.pop("_exchange", "BYBIT")
 
     last_price = safe_float(item.get("lastPrice"))
     prev_price_24h = safe_float(item.get("prevPrice24h"))
@@ -130,7 +162,7 @@ def build_crypto_quote_data(symbol: str):
         "symbol": symbol,
         "name": symbol,
         "currency": "USDT",
-        "exchange": "BYBIT",
+        "exchange": exch,
         "price": round(last_price, 8) if last_price is not None else None,
         "previous_close": round(prev_price_24h, 8) if prev_price_24h is not None else None,
         "change": change,
@@ -339,42 +371,37 @@ def map_chart_interval_to_bybit(interval: str) -> str:
 
 
 def build_crypto_chart_data(symbol: str, interval: str, period: str):
-    """建立 Crypto K 線資料"""
+    """建立 Crypto K 線資料（Bybit 失敗則 Binance）"""
+    import pandas as pd
+
     symbol = normalize_crypto_symbol(symbol)
     bybit_interval = map_chart_interval_to_bybit(interval)
 
-    url = f"{BYBIT_BASE_URL}/v5/market/kline"
-    params = {
-        "category": "spot",
-        "symbol": symbol,
-        "interval": bybit_interval,
-        "limit": 200,
-    }
-
-    resp = requests.get(url, params=params, timeout=10)
-    resp.raise_for_status()
-    data = resp.json()
-
-    if data.get("retCode") != 0:
-        raise HTTPException(status_code=404, detail=f"Bybit 查無圖表資料: {symbol}")
-
-    rows = data.get("result", {}).get("list", [])
-    if not rows:
-        raise HTTPException(status_code=404, detail=f"Bybit 查無圖表資料: {symbol}")
+    try:
+        df, _exch = get_crypto_kline_with_fallback(symbol, bybit_interval, 200)
+    except Exception as e:
+        raise HTTPException(
+            status_code=404,
+            detail=f"無法取得 Crypto 圖表: {symbol} ({e!r})",
+        ) from e
 
     candles = []
-    for row in reversed(rows):
-        ts = int(row[0])
-        open_price = safe_float(row[1])
-        high_price = safe_float(row[2])
-        low_price = safe_float(row[3])
-        close_price = safe_float(row[4])
-        volume = safe_float(row[5])
+    for idx, row in df.iterrows():
+        t = pd.Timestamp(idx)
+        if t.tzinfo is None:
+            t = t.tz_localize("UTC")
+        else:
+            t = t.tz_convert("UTC")
+        time_str = t.isoformat()
+
+        open_price = safe_float(row.get("Open"))
+        high_price = safe_float(row.get("High"))
+        low_price = safe_float(row.get("Low"))
+        close_price = safe_float(row.get("Close"))
+        volume = safe_float(row.get("Volume"))
 
         if None in (open_price, high_price, low_price, close_price):
             continue
-
-        time_str = datetime.fromtimestamp(ts / 1000, tz=timezone.utc).isoformat()
 
         candles.append(
             MarketCandleItem(
@@ -394,45 +421,24 @@ def build_crypto_chart_data(symbol: str, interval: str, period: str):
         candles=candles,
     )
 def build_crypto_market_data(symbol: str, interval: str = "1d") -> dict:
-    """提供 AI 分析用的 Crypto 資料（走 Bybit）"""
+    """提供 AI 分析用的 Crypto 資料（Bybit 失敗則 Binance）"""
     import pandas as pd
 
     symbol = normalize_crypto_symbol(symbol)
     bybit_interval = map_chart_interval_to_bybit(interval)
 
-    url = f"{BYBIT_BASE_URL}/v5/market/kline"
-    params = {
-        "category": "spot",
-        "symbol": symbol,
-        "interval": bybit_interval,
-        "limit": 200,
-    }
+    try:
+        df, _exch = get_crypto_kline_with_fallback(symbol, bybit_interval, 200)
+    except Exception as e:
+        raise HTTPException(
+            status_code=404,
+            detail=f"無法取得 Crypto 可分析資料: {symbol} ({e!r})",
+        ) from e
 
-    resp = requests.get(url, params=params, timeout=10)
-    resp.raise_for_status()
-    data = resp.json()
-
-    if data.get("retCode") != 0:
-        raise HTTPException(status_code=404, detail=f"Bybit 查無可分析資料: {symbol}")
-
-    rows = data.get("result", {}).get("list", [])
-    if not rows:
-        raise HTTPException(status_code=404, detail=f"Bybit 查無可分析資料: {symbol}")
-
-    df = pd.DataFrame(
-        reversed(rows),
-        columns=["timestamp", "Open", "High", "Low", "Close", "Volume", "Turnover"]
-    )
-
-    df["timestamp"] = pd.to_datetime(df["timestamp"].astype("int64"), unit="ms", utc=True)
-
-    for col in ["Open", "High", "Low", "Close", "Volume", "Turnover"]:
-        df[col] = df[col].apply(safe_float)
-
-    df = df.dropna(subset=["Open", "High", "Low", "Close"]).reset_index(drop=True)
+    df = df.reset_index(drop=True)
 
     if df.empty:
-        raise HTTPException(status_code=404, detail=f"Bybit 查無有效可分析資料: {symbol}")
+        raise HTTPException(status_code=404, detail=f"查無有效可分析資料: {symbol}")
 
     # MA20
     df["MA20"] = df["Close"].rolling(20).mean()

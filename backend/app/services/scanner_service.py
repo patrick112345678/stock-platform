@@ -12,6 +12,7 @@ from app.db.database import SessionLocal
 from sqlalchemy import text
 
 BYBIT_BASE_URL = "https://api.bybit.com"
+BINANCE_API_BASE = "https://api.binance.com/api/v3"
 
 DEFAULT_TW_SYMBOLS = [
     "2330.TW", "2317.TW", "2454.TW", "2303.TW", "2882.TW",
@@ -414,6 +415,26 @@ def get_bybit_spot_tickers() -> List[Dict[str, Any]]:
     return data["result"]["list"]
 
 
+def map_bybit_interval_to_binance(interval: str) -> str:
+    """Bybit interval 字元 → Binance klines interval"""
+    m = {
+        "D": "1d",
+        "W": "1w",
+        "M": "1M",
+        "60": "1h",
+        "120": "2h",
+        "240": "4h",
+        "360": "6h",
+        "720": "12h",
+        "1": "1m",
+        "3": "3m",
+        "5": "5m",
+        "15": "15m",
+        "30": "30m",
+    }
+    return m.get(interval, "1d")
+
+
 def get_bybit_kline(symbol: str, interval: str = "D", limit: int = 120) -> pd.DataFrame:
     url = f"{BYBIT_BASE_URL}/v5/market/kline"
     params = {
@@ -450,6 +471,94 @@ def get_bybit_kline(symbol: str, interval: str = "D", limit: int = 120) -> pd.Da
         raise ValueError(f"crypto K 線不足: {symbol}")
 
     return df
+
+
+def get_binance_kline(symbol: str, interval: str = "D", limit: int = 120) -> pd.DataFrame:
+    """Binance 現貨 K 線，輸出欄位結構與 get_bybit_kline 一致"""
+    bi = map_bybit_interval_to_binance(interval)
+    url = f"{BINANCE_API_BASE}/klines"
+    r = requests.get(
+        url,
+        params={"symbol": symbol, "interval": bi, "limit": limit},
+        timeout=15,
+    )
+    r.raise_for_status()
+    raw = r.json()
+    if not raw:
+        raise ValueError(f"Binance K 線為空: {symbol}")
+
+    rows = []
+    for k in raw:
+        qv = float(k[7]) if len(k) > 7 else 0.0
+        rows.append([int(k[0]), k[1], k[2], k[3], k[4], k[5], qv])
+
+    rows = list(rows)
+
+    df = pd.DataFrame(
+        rows,
+        columns=["startTime", "Open", "High", "Low", "Close", "Volume", "Turnover"],
+    )
+
+    for col in ["Open", "High", "Low", "Close", "Volume", "Turnover"]:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+
+    df["Datetime"] = pd.to_datetime(df["startTime"].astype("int64"), unit="ms")
+    df = df.set_index("Datetime").dropna()
+
+    if len(df) < 2:
+        raise ValueError(f"Binance crypto K 線不足: {symbol}")
+
+    return df
+
+
+def get_crypto_kline_with_fallback(symbol: str, interval: str = "D", limit: int = 120) -> tuple[pd.DataFrame, str]:
+    """先 Bybit，失敗則 Binance。回傳 (DataFrame, 'BYBIT'|'BINANCE')"""
+    try:
+        return get_bybit_kline(symbol, interval, limit), "BYBIT"
+    except Exception as e:
+        print("WARN Bybit kline failed, trying Binance:", symbol, repr(e))
+        try:
+            return get_binance_kline(symbol, interval, limit), "BINANCE"
+        except Exception as e2:
+            raise ValueError(
+                f"Bybit 與 Binance 皆無法取得 K 線: {symbol}: {e2!r}"
+            ) from e2
+
+
+def get_binance_spot_tickers_normalized() -> List[Dict[str, Any]]:
+    """Binance 全現貨 24h，格式對齊 Bybit tickers 列表以利後續排序／排行榜"""
+    r = requests.get(f"{BINANCE_API_BASE}/ticker/24hr", timeout=25)
+    r.raise_for_status()
+    data = r.json()
+    out: List[Dict[str, Any]] = []
+    for t in data:
+        sym = t.get("symbol") or ""
+        if not sym.endswith("USDT"):
+            continue
+        lp = safe_float(t.get("lastPrice"))
+        op = safe_float(t.get("openPrice"))
+        qv = safe_float(t.get("quoteVolume")) or 0.0
+        pcp = safe_float(t.get("priceChangePercent"))
+        # Bybit price24hPcnt 為小數（例如 0.0123 = 1.23%）
+        pfrac = (pcp / 100.0) if pcp is not None else None
+        out.append(
+            {
+                "symbol": sym,
+                "lastPrice": str(lp) if lp is not None else "0",
+                "prevPrice24h": str(op) if op is not None else "0",
+                "price24hPcnt": str(pfrac) if pfrac is not None else "0",
+                "turnover24h": str(qv),
+            }
+        )
+    return out
+
+
+def get_spot_tickers_with_fallback() -> List[Dict[str, Any]]:
+    try:
+        return get_bybit_spot_tickers()
+    except Exception as e:
+        print("WARN Bybit spot tickers failed, using Binance:", repr(e))
+        return get_binance_spot_tickers_normalized()
 
 
 def get_tw_universe(pool="TOP100"):
@@ -619,10 +728,10 @@ def get_crypto_universe(pool: str = "TOP100") -> List[str]:
     pool = str(pool).upper()
 
     try:
-        tickers = get_bybit_spot_tickers()
+        tickers = get_spot_tickers_with_fallback()
         symbols = sorted(
             [x for x in tickers if x["symbol"].endswith("USDT")],
-            key=lambda x: float(x["turnover24h"]),
+            key=lambda x: float(x.get("turnover24h") or 0),
             reverse=True
         )
         symbols = [x["symbol"] for x in symbols]
@@ -747,12 +856,12 @@ def process_tw_symbol(yf_symbol: str):
 
 def process_crypto_symbol(symbol: str):
     try:
-        df = get_bybit_kline(symbol)
+        df, exch = get_crypto_kline_with_fallback(symbol)
         return build_opportunity_from_df(
             df=df,
             symbol=symbol,
             market="CRYPTO",
-            exchange="BYBIT",
+            exchange=exch,
             display_symbol=symbol,
             min_bars=40,
         )
@@ -786,7 +895,10 @@ def get_tw_opportunities(pool="TOP100", limit=20):
      return get_cached_results("TW", limit)
 
 def get_crypto_opportunities(limit=20):
-    """Crypto 24h 交易，優先即時抓取，失敗則用快取（與排行榜邏輯一致）"""
+    """Crypto：以 10 分鐘背景快取為主；快取為空再即時抓（Bybit→Binance），失敗再回快取。"""
+    cached = get_cached_results("CRYPTO", max(limit, 80))
+    if cached:
+        return enrich_tw_names(cached[:limit], "CRYPTO")
     try:
         symbols = get_crypto_universe("ALL")[:200]
         results = run_parallel(symbols, process_crypto_symbol)
@@ -841,7 +953,7 @@ def get_stock_leaderboard(sort: str = "change_percent", limit: int = 20) -> List
 
 
 def get_crypto_leaderboard(sort: str = "change_percent", limit: int = 20) -> List[Dict[str, Any]]:
-    tickers = get_bybit_spot_tickers()
+    tickers = get_spot_tickers_with_fallback()
     results = []
 
     for item in tickers:
@@ -929,12 +1041,13 @@ def get_leaderboard(
         # 台股、美股：收盤後資料不變，直接用快取，不即時重算
         items = _from_cache()
     else:
-        # Crypto：24h 交易，可即時抓取，失敗則用快取
-        try:
-            items = _live_crypto()
-        except Exception as e:
-            print("WARN leaderboard crypto live fetch failed, using cache:", repr(e))
-            items = _from_cache()
+        # Crypto：以 10 分鐘背景快取為主；快取為空再即時抓（Bybit→Binance），失敗再回快取
+        items = _from_cache()
+        if not items:
+            try:
+                items = _live_crypto()
+            except Exception as e:
+                print("WARN leaderboard crypto live fetch failed:", repr(e))
         if not items:
             items = _from_cache()
 
