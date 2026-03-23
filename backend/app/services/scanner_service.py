@@ -572,25 +572,58 @@ def get_spot_tickers_with_fallback() -> List[Dict[str, Any]]:
         return get_binance_spot_tickers_normalized()
 
 
+def _fetch_twse_stock_day_all() -> List[Dict[str, Any]]:
+    """
+    拉取 TWSE OpenAPI 每日收盤報表。部分環境（OpenSSL 3）對 TWSE 憑證鏈會報 Missing SKI；
+    先以 certifi 驗證，若仍 SSLError 則對該官方網址再試 verify=False。
+    """
+    url = "https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL"
+    headers = {
+        "User-Agent": REQUEST_HEADERS["User-Agent"],
+        "Accept": "application/json",
+    }
+    try:
+        import certifi
+
+        verify = certifi.where()
+    except Exception:
+        verify = True
+    try:
+        resp = requests.get(url, timeout=15, headers=headers, verify=verify)
+        resp.raise_for_status()
+        data = resp.json()
+    except requests.exceptions.SSLError as e:
+        print("WARN TWSE SSL verify failed, retrying without verify:", repr(e))
+        import urllib3
+
+        urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+        resp = requests.get(url, timeout=15, headers=headers, verify=False)
+        resp.raise_for_status()
+        data = resp.json()
+    if isinstance(data, dict) and "data" in data:
+        data = data["data"]
+    if not isinstance(data, list):
+        return []
+    return data
+
+
 def get_tw_universe(pool="TOP100"):
     try:
-        url = "https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL"
-        try:
-            import certifi
-
-            verify = certifi.where()
-        except Exception:
-            verify = True
-        data = requests.get(
-            url,
-            timeout=15,
-            headers={"User-Agent": REQUEST_HEADERS["User-Agent"]},
-            verify=verify,
-        ).json()
-        symbols = [item["Code"] + ".TW" for item in data if item["Code"].isdigit()]
+        data = _fetch_twse_stock_day_all()
+        symbols = [
+            item["Code"] + ".TW"
+            for item in data
+            if str(item.get("Code", "")).isdigit()
+        ]
+        if not symbols:
+            raise ValueError("TWSE returned empty symbol list")
     except Exception as e:
         print("❌ get_tw_universe failed:", repr(e))
-        symbols = DEFAULT_TW_SYMBOLS
+        # 優先使用專案內 tw_stock_master.json，比 DEFAULT_TW_SYMBOLS 完整
+        fb = _load_tw_stock_master_fallback()
+        symbols = [str(x["symbol"]).strip() + ".TW" for x in fb if x.get("symbol")]
+        if not symbols:
+            symbols = list(DEFAULT_TW_SYMBOLS)
 
     pool = str(pool).upper()
 
@@ -642,15 +675,7 @@ def get_tw_search_items() -> List[Dict[str, str]]:
     if TW_SEARCH_CACHE is not None:
         return TW_SEARCH_CACHE
     try:
-        url = "https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL"
-        resp = requests.get(url, timeout=15)
-        resp.raise_for_status()
-        data = resp.json()
-        # API 可能回傳 list 或 {"data": [...]}
-        if isinstance(data, dict) and "data" in data:
-            data = data["data"]
-        elif not isinstance(data, list):
-            data = []
+        data = _fetch_twse_stock_day_all()
         items = []
         for item in data:
             code = item.get("Code", "")

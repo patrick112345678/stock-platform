@@ -16,8 +16,10 @@ psycopg2-binary
 # ========== 專案功能 ==========
 yfinance>=1.0
 pandas
+lxml
 numpy
 requests
+certifi
 google-genai
 pycryptodome
 
