@@ -42,7 +42,37 @@ def analyze_symbol(
     except Exception as e:
         print("ROUTER /ai/analyze ERROR:", repr(e))
         print(traceback.format_exc())
-        raise HTTPException(status_code=500, detail=f"AI 分析失敗: {e}")
+        # 行情/AI 異常時仍回 200 + 可讀摘要，避免前端整页 500
+        lang = getattr(payload, "lang", None) or "zh"
+        line = (
+            "目前市場資料暫時無法取得，請稍後再試。"
+            if lang != "en"
+            else "Market data is temporarily unavailable."
+        )
+        sym = str(payload.symbol).strip().upper()
+        return {
+            "symbol": sym,
+            "name": sym,
+            "market": payload.market,
+            "interval": payload.interval,
+            "quick_summary": {
+                "trend": "無資料",
+                "valuation": "無資料",
+                "risk": "無資料",
+                "patterns": [],
+                "bullish": [],
+                "bearish": [],
+                "one_line": line,
+                "bull_strength": 0,
+                "bear_strength": 0,
+                "support": None,
+                "resistance": None,
+                "up_target": None,
+                "down_target": None,
+                "signal_table": [],
+            },
+            "ai_report": None,
+        }
 @router.post("/opportunities", response_model=AIOpportunitiesResponse)
 def analyze_opportunities(
     payload: AIOpportunitiesRequest,

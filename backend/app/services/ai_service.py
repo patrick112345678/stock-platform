@@ -228,6 +228,30 @@ def _load_ai_opportunity_cache(market: str, lang: str, limit: int = 20) -> tuple
         db.close()
 
 
+def _ai_market_data_unavailable_summary(lang: str) -> dict:
+    """Yahoo / 行情失敗時給前端的 quick_summary（不拋 500）。"""
+    if lang == "en":
+        line = "Market data is temporarily unavailable. Please try again later."
+    else:
+        line = "目前市場資料暫時無法取得，請稍後再試。"
+    return {
+        "trend": "無資料",
+        "valuation": "無資料",
+        "risk": "無資料",
+        "patterns": [],
+        "bullish": [],
+        "bearish": [],
+        "one_line": line,
+        "bull_strength": 0,
+        "bear_strength": 0,
+        "support": None,
+        "resistance": None,
+        "up_target": None,
+        "down_target": None,
+        "signal_table": [],
+    }
+
+
 def _is_ai_cache_fresh(
     market: str,
     lang: str,
@@ -262,26 +286,74 @@ class AIService:
         lang: str = "zh",
         quick_only: bool = True,
     ):
+        sym_u = str(symbol).strip().upper()
         try:
             data = get_market_data(symbol=symbol, market=market, interval=interval)
-
-            if not data or data.get("hist") is None:
-                raise ValueError("查無可分析資料")
-
-            quick_summary = build_quick_summary(data, lang=lang)
-            if quick_summary is None:
-                raise ValueError("quick_summary 產生失敗")
-
-            result = {
-                "symbol": data.get("raw_symbol") or symbol.upper(),
-                "name": data.get("name"),
+        except Exception as e:
+            print("AIService.analyze_symbol get_market_data ERROR:", repr(e))
+            print(traceback.format_exc())
+            return {
+                "symbol": sym_u,
+                "name": sym_u,
                 "market": market,
                 "interval": interval,
-                "quick_summary": quick_summary,
+                "quick_summary": _ai_market_data_unavailable_summary(lang),
                 "ai_report": None,
             }
 
-            if not quick_only:
+        if not data or data.get("hist") is None:
+            hist_empty = True
+        else:
+            hist = data.get("hist")
+            hist_empty = getattr(hist, "empty", True) if hist is not None else True
+
+        if hist_empty:
+            qs = build_quick_summary(
+                {
+                    "hist": None,
+                    "name": sym_u,
+                    "raw_symbol": sym_u,
+                    "support": data.get("support") if data else None,
+                    "resistance": data.get("resistance") if data else None,
+                    "pe": None,
+                    "pb": None,
+                },
+                lang=lang,
+            )
+            qs["one_line"] = (
+                "目前市場資料暫時無法取得，請稍後再試。"
+                if lang != "en"
+                else "Market data is temporarily unavailable."
+            )
+            return {
+                "symbol": str(data.get("raw_symbol") or sym_u) if data else sym_u,
+                "name": (data.get("name") if data else None) or sym_u,
+                "market": market,
+                "interval": interval,
+                "quick_summary": qs,
+                "ai_report": None,
+            }
+
+        try:
+            quick_summary = build_quick_summary(data, lang=lang)
+        except Exception as e:
+            print("AIService.analyze_symbol build_quick_summary ERROR:", repr(e))
+            quick_summary = _ai_market_data_unavailable_summary(lang)
+
+        if quick_summary is None:
+            quick_summary = _ai_market_data_unavailable_summary(lang)
+
+        result = {
+            "symbol": data.get("raw_symbol") or sym_u,
+            "name": data.get("name") or sym_u,
+            "market": market,
+            "interval": interval,
+            "quick_summary": quick_summary,
+            "ai_report": None,
+        }
+
+        if not quick_only:
+            try:
                 api_key = os.getenv("GEMINI_API_KEY", "")
                 if not api_key:
                     raise ValueError("缺少 GEMINI_API_KEY")
@@ -322,15 +394,27 @@ class AIService:
                         else:
                             raw = {"summary": text_resp[:300], "action": "請檢查 AI 回傳格式"}
 
-                    # 正規化 ai_report：確保 trend/valuation/risk/summary/action 為字串（Gemini 可能回傳巢狀物件）
                     result["ai_report"] = _normalize_ai_report(raw)
+            except ValueError:
+                raise
+            except Exception as e:
+                print("AIService.analyze_symbol Gemini ERROR:", repr(e))
+                print(traceback.format_exc())
+                result["ai_report"] = {
+                    "trend": "無法判斷",
+                    "valuation": "資料不足",
+                    "risk": "無法完成 AI 分析",
+                    "summary": "目前市場資料或 AI 服務暫時無法取得，請稍後再試。",
+                    "action": "請稍後重試",
+                    "confidence_detail": {
+                        "overall": "low",
+                        "fundamental": "low",
+                        "technical": "low",
+                        "industry": "low",
+                    },
+                }
 
-            return result
-
-        except Exception as e:
-            print("AIService.analyze_symbol ERROR:", repr(e))
-            print(traceback.format_exc())
-            raise
+        return result
 
     @staticmethod
     def analyze_opportunities(candidates: list[dict], market: str = "TW", lang: str = "zh"):

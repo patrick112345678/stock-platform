@@ -14,6 +14,11 @@ from typing import Any, Dict, Tuple
 import pandas as pd
 import yfinance as yf
 
+try:
+    from yfinance.exceptions import YFDataException
+except Exception:
+    YFDataException = Exception  # type: ignore[misc, assignment]
+
 # 每個 symbol 快取 60 秒（key = yfinance 代號，如 2330.TW、AAPL）
 _CACHE: Dict[str, Tuple[float, Dict[str, Any]]] = {}
 CACHE_TTL_SECONDS = 60
@@ -21,7 +26,9 @@ YFINANCE_FETCH_TIMEOUT = 5.0
 
 
 def _yf_history_only(yf_symbol: str) -> pd.DataFrame:
-    """僅呼叫一次 Ticker.history，不傳入 session。"""
+    """
+    僅呼叫 yf.Ticker(symbol).history，禁止傳入 requests.Session / 自訂 session。
+    """
     ticker = yf.Ticker(yf_symbol)
     return ticker.history(period="3mo", interval="1d", auto_adjust=False)
 
@@ -52,12 +59,15 @@ def fetch_stock_data(yf_symbol: str) -> Dict[str, Any]:
             "hist": None,
             "error": "yfinance_timeout",
         }
-    except Exception as e:
+    except (YFDataException, Exception) as e:
+        err_msg = str(e)
+        if "session" in err_msg.lower() or "curl_cffi" in err_msg.lower():
+            err_msg = "yfinance_session_error"
         return {
             "ok": False,
             "symbol": key,
             "hist": None,
-            "error": str(e),
+            "error": err_msg,
         }
 
     if df is None or df.empty:

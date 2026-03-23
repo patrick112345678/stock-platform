@@ -283,8 +283,40 @@ def get_quote_data(symbol: str, market: str = "stock"):
     market = str(market).strip().lower()
 
     if market == "crypto":
-        return build_crypto_quote_data(raw_symbol)
+        try:
+            return build_crypto_quote_data(raw_symbol)
+        except Exception as e:
+            print("WARN get_quote_data crypto:", repr(e))
+            sym = normalize_crypto_symbol(raw_symbol)
+            return {
+                "symbol": sym,
+                "name": sym,
+                "currency": "USDT",
+                "exchange": None,
+                "price": 0.0,
+                "previous_close": None,
+                "change": None,
+                "change_percent": None,
+            }
 
+    try:
+        return _get_quote_data_stock(raw_symbol, market)
+    except Exception as e:
+        print("WARN get_quote_data:", repr(e))
+        stock_symbol = normalize_stock_symbol(raw_symbol)
+        return {
+            "symbol": stock_symbol,
+            "name": stock_symbol,
+            "currency": "TWD" if stock_symbol.endswith(".TW") else None,
+            "exchange": None,
+            "price": 0.0,
+            "previous_close": None,
+            "change": None,
+            "change_percent": None,
+        }
+
+
+def _get_quote_data_stock(raw_symbol: str, _market: str) -> Dict[str, Any]:
     stock_symbol = normalize_stock_symbol(raw_symbol)
     bundle = get_cached_data(stock_symbol)
     hist = bundle.get("hist") if bundle.get("ok") else None
@@ -348,7 +380,40 @@ def get_detail_data(symbol: str, market: str = "stock"):
     market = str(market).strip().lower()
 
     if market == "crypto":
-        quote = build_crypto_quote_data(raw_symbol)
+        try:
+            quote = build_crypto_quote_data(raw_symbol)
+        except Exception as e:
+            print("WARN get_detail_data crypto:", repr(e))
+            sym = normalize_crypto_symbol(raw_symbol)
+            return {
+                "symbol": sym,
+                "raw_symbol": raw_symbol,
+                "name": raw_symbol,
+                "market": "海外/其他",
+                "industry": "Cryptocurrency",
+                "sector": "Crypto",
+                "price": None,
+                "change": None,
+                "change_percent": None,
+                "market_cap": None,
+                "fifty_two_week_high": None,
+                "fifty_two_week_low": None,
+                "pe": None,
+                "pb": None,
+                "eps": None,
+                "roe": None,
+                "gross": None,
+                "revenue": None,
+                "debt": None,
+                "valuation": None,
+                "currency": "USDT",
+                "exchange": None,
+                "interval": "1d",
+                "fetch_interval": "1d",
+                "period": "1y",
+                "data_quality": "無資料",
+                "errors": [],
+            }
         return {
             "symbol": quote["symbol"],
             "raw_symbol": raw_symbol,
@@ -379,50 +444,85 @@ def get_detail_data(symbol: str, market: str = "stock"):
             "errors": [],
         }
 
-    stock_symbol = normalize_stock_symbol(raw_symbol)
-    bundle = get_cached_data(stock_symbol)
-    hist = bundle.get("hist") if bundle.get("ok") else None
+    try:
+        stock_symbol = normalize_stock_symbol(raw_symbol)
+        bundle = get_cached_data(stock_symbol)
+        hist = bundle.get("hist") if bundle.get("ok") else None
 
-    quote = get_quote_data(symbol, market)
-    market_label = "台股/櫃買" if stock_symbol.endswith((".TW", ".TWO")) or raw_symbol.isdigit() else "海外/其他"
+        quote = get_quote_data(symbol, market)
+        market_label = "台股/櫃買" if stock_symbol.endswith((".TW", ".TWO")) or raw_symbol.isdigit() else "海外/其他"
 
-    hi = safe_float(hist["High"].max()) if hist is not None and not hist.empty and "High" in hist.columns else None
-    lo = safe_float(hist["Low"].min()) if hist is not None and not hist.empty and "Low" in hist.columns else None
+        hi = safe_float(hist["High"].max()) if hist is not None and not hist.empty and "High" in hist.columns else None
+        lo = safe_float(hist["Low"].min()) if hist is not None and not hist.empty and "Low" in hist.columns else None
 
-    quality = "基本"
-    if hi is not None and lo is not None:
-        quality = "部分"
+        quality = "基本"
+        if hi is not None and lo is not None:
+            quality = "部分"
 
-    return {
-        "symbol": stock_symbol,
-        "raw_symbol": raw_symbol,
-        "name": quote.get("name") or stock_symbol,
-        "market": market_label,
-        "industry": "N/A",
-        "sector": "N/A",
-        "display_industry": "N/A",
-        "price": quote.get("price"),
-        "change": quote.get("change"),
-        "change_percent": quote.get("change_percent"),
-        "market_cap": None,
-        "fifty_two_week_high": hi,
-        "fifty_two_week_low": lo,
-        "pe": None,
-        "pb": None,
-        "eps": None,
-        "roe": None,
-        "gross": None,
-        "revenue": None,
-        "debt": None,
-        "valuation": None,
-        "currency": quote.get("currency"),
-        "exchange": quote.get("exchange"),
-        "interval": "1d",
-        "fetch_interval": "1d",
-        "period": "3mo",
-        "data_quality": quality,
-        "errors": [],
-    }
+        return {
+            "symbol": stock_symbol,
+            "raw_symbol": raw_symbol,
+            "name": quote.get("name") or stock_symbol,
+            "market": market_label,
+            "industry": "N/A",
+            "sector": "N/A",
+            "display_industry": "N/A",
+            "price": quote.get("price"),
+            "change": quote.get("change"),
+            "change_percent": quote.get("change_percent"),
+            "market_cap": None,
+            "fifty_two_week_high": hi,
+            "fifty_two_week_low": lo,
+            "pe": None,
+            "pb": None,
+            "eps": None,
+            "roe": None,
+            "gross": None,
+            "revenue": None,
+            "debt": None,
+            "valuation": None,
+            "currency": quote.get("currency"),
+            "exchange": quote.get("exchange"),
+            "interval": "1d",
+            "fetch_interval": "1d",
+            "period": "3mo",
+            "data_quality": quality,
+            "errors": [],
+        }
+    except Exception as e:
+        print("WARN get_detail_data:", repr(e))
+        sym = normalize_stock_symbol(raw_symbol)
+        mlabel = "台股/櫃買" if sym.endswith((".TW", ".TWO")) or raw_symbol.isdigit() else "海外/其他"
+        return {
+            "symbol": sym,
+            "raw_symbol": raw_symbol,
+            "name": sym,
+            "market": mlabel,
+            "industry": "N/A",
+            "sector": "N/A",
+            "display_industry": "N/A",
+            "price": None,
+            "change": None,
+            "change_percent": None,
+            "market_cap": None,
+            "fifty_two_week_high": None,
+            "fifty_two_week_low": None,
+            "pe": None,
+            "pb": None,
+            "eps": None,
+            "roe": None,
+            "gross": None,
+            "revenue": None,
+            "debt": None,
+            "valuation": None,
+            "currency": None,
+            "exchange": None,
+            "interval": "1d",
+            "fetch_interval": "1d",
+            "period": "3mo",
+            "data_quality": "無資料",
+            "errors": [],
+        }
 
 
 def get_peer_symbols(symbol: str, market: str, max_peers: int = 5) -> List[str]:
@@ -536,6 +636,15 @@ def get_chart_data(symbol: str, interval: str, period: str):
     if is_crypto_symbol(raw_symbol):
         return build_crypto_chart_data(raw_symbol, interval, period)
 
+    try:
+        return _get_chart_data_stock(raw_symbol, interval, period)
+    except Exception as e:
+        print("WARN get_chart_data:", repr(e))
+        sym = normalize_stock_symbol(raw_symbol)
+        return MarketChartResponse(symbol=sym, interval=interval, period=period, candles=[])
+
+
+def _get_chart_data_stock(raw_symbol: str, interval: str, period: str) -> MarketChartResponse:
     sym = normalize_stock_symbol(raw_symbol)
     bundle = get_cached_data(sym)
     hist = bundle.get("hist") if bundle.get("ok") else None
@@ -582,18 +691,78 @@ def get_market_data(symbol: str, market: str = "US", interval: str = "1d", perio
     raw_symbol = str(symbol).strip().upper()
     market_upper = str(market).strip().upper()
 
-    if market_upper == "CRYPTO":
-        return build_crypto_market_data(raw_symbol, interval)
+    try:
+        if market_upper == "CRYPTO":
+            return build_crypto_market_data(raw_symbol, interval)
 
-    if market_upper == "TW":
-        yf_symbol = normalize_stock_symbol(raw_symbol)
-    else:
-        yf_symbol = raw_symbol
+        if market_upper == "TW":
+            yf_symbol = normalize_stock_symbol(raw_symbol)
+        else:
+            yf_symbol = raw_symbol
 
-    bundle = get_cached_data(yf_symbol)
-    hist = bundle.get("hist") if bundle.get("ok") else None
+        bundle = get_cached_data(yf_symbol)
+        hist = bundle.get("hist") if bundle.get("ok") else None
 
-    if hist is None or hist.empty:
+        if hist is None or hist.empty:
+            return {
+                "raw_symbol": raw_symbol,
+                "name": raw_symbol,
+                "market": market_upper,
+                "price": None,
+                "support": None,
+                "resistance": None,
+                "pe": None,
+                "pb": None,
+                "hist": pd.DataFrame(),
+            }
+
+        if interval == "1d":
+            _period = period or "6mo"
+            hist = _slice_hist_by_period(hist, _period if _period in ("1mo", "3mo", "6mo", "1y", "2y") else "6mo")
+        elif interval == "1wk":
+            hist = _slice_hist_by_period(hist, "2y")
+            hist = _resample_daily_to_weekly(hist)
+        elif interval == "4h":
+            hist = _slice_hist_by_period(hist, "3mo")
+            hist = _resample_daily_to_4d(hist)
+        elif interval == "1h":
+            hist = hist.tail(40)
+        else:
+            hist = _slice_hist_by_period(hist, "6mo")
+
+        hist = _add_technical_columns(hist)
+
+        if hist is None or hist.empty:
+            return {
+                "raw_symbol": raw_symbol,
+                "name": raw_symbol,
+                "market": market_upper,
+                "price": None,
+                "support": None,
+                "resistance": None,
+                "pe": None,
+                "pb": None,
+                "hist": pd.DataFrame(),
+            }
+
+        latest_close = safe_float(hist["Close"].iloc[-1])
+        recent = hist.tail(20)
+        support = safe_float(recent["Low"].min()) if not recent.empty else None
+        resistance = safe_float(recent["High"].max()) if not recent.empty else None
+
+        return {
+            "raw_symbol": raw_symbol,
+            "name": raw_symbol,
+            "market": market_upper,
+            "price": latest_close,
+            "support": support,
+            "resistance": resistance,
+            "pe": None,
+            "pb": None,
+            "hist": hist,
+        }
+    except Exception as e:
+        print("WARN get_market_data:", repr(e))
         return {
             "raw_symbol": raw_symbol,
             "name": raw_symbol,
@@ -605,52 +774,6 @@ def get_market_data(symbol: str, market: str = "US", interval: str = "1d", perio
             "pb": None,
             "hist": pd.DataFrame(),
         }
-
-    if interval == "1d":
-        _period = period or "6mo"
-        hist = _slice_hist_by_period(hist, _period if _period in ("1mo", "3mo", "6mo", "1y", "2y") else "6mo")
-    elif interval == "1wk":
-        hist = _slice_hist_by_period(hist, "2y")
-        hist = _resample_daily_to_weekly(hist)
-    elif interval == "4h":
-        hist = _slice_hist_by_period(hist, "3mo")
-        hist = _resample_daily_to_4d(hist)
-    elif interval == "1h":
-        hist = hist.tail(40)
-    else:
-        hist = _slice_hist_by_period(hist, "6mo")
-
-    hist = _add_technical_columns(hist)
-
-    if hist is None or hist.empty:
-        return {
-            "raw_symbol": raw_symbol,
-            "name": raw_symbol,
-            "market": market_upper,
-            "price": None,
-            "support": None,
-            "resistance": None,
-            "pe": None,
-            "pb": None,
-            "hist": pd.DataFrame(),
-        }
-
-    latest_close = safe_float(hist["Close"].iloc[-1])
-    recent = hist.tail(20)
-    support = safe_float(recent["Low"].min()) if not recent.empty else None
-    resistance = safe_float(recent["High"].max()) if not recent.empty else None
-
-    return {
-        "raw_symbol": raw_symbol,
-        "name": raw_symbol,
-        "market": market_upper,
-        "price": latest_close,
-        "support": support,
-        "resistance": resistance,
-        "pe": None,
-        "pb": None,
-        "hist": hist,
-    }
 
 
 def get_multi_timeframe_summary(symbol: str, market: str = "US", lang: str = "zh") -> List[Dict[str, Any]]:
