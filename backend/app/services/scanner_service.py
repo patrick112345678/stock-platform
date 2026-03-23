@@ -14,6 +14,12 @@ from sqlalchemy import text
 BYBIT_BASE_URL = "https://api.bybit.com"
 BINANCE_API_BASE = "https://api.binance.com/api/v3"
 
+# 雲端 IP 若無 User-Agent，Bybit/Binance 常回 403；仍無法解決 Binance 對美國 IP 的 451 地區封鎖
+REQUEST_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (compatible; StockPlatform/1.0; +https://example.com)",
+    "Accept": "application/json",
+}
+
 DEFAULT_TW_SYMBOLS = [
     "2330.TW", "2317.TW", "2454.TW", "2303.TW", "2882.TW",
     "6505.TW", "2308.TW", "2881.TW", "2886.TW", "1303.TW",
@@ -405,7 +411,7 @@ def get_stock_hist(symbol: str, period: str = "6mo", interval: str = "1d") -> pd
 def get_bybit_spot_tickers() -> List[Dict[str, Any]]:
     url = f"{BYBIT_BASE_URL}/v5/market/tickers"
     params = {"category": "spot"}
-    r = requests.get(url, params=params, timeout=15)
+    r = requests.get(url, params=params, timeout=15, headers=REQUEST_HEADERS)
     r.raise_for_status()
     data = r.json()
 
@@ -443,7 +449,7 @@ def get_bybit_kline(symbol: str, interval: str = "D", limit: int = 120) -> pd.Da
         "interval": interval,
         "limit": limit,
     }
-    r = requests.get(url, params=params, timeout=15)
+    r = requests.get(url, params=params, timeout=15, headers=REQUEST_HEADERS)
     r.raise_for_status()
     data = r.json()
 
@@ -481,6 +487,7 @@ def get_binance_kline(symbol: str, interval: str = "D", limit: int = 120) -> pd.
         url,
         params={"symbol": symbol, "interval": bi, "limit": limit},
         timeout=15,
+        headers=REQUEST_HEADERS,
     )
     r.raise_for_status()
     raw = r.json()
@@ -527,7 +534,11 @@ def get_crypto_kline_with_fallback(symbol: str, interval: str = "D", limit: int 
 
 def get_binance_spot_tickers_normalized() -> List[Dict[str, Any]]:
     """Binance 全現貨 24h，格式對齊 Bybit tickers 列表以利後續排序／排行榜"""
-    r = requests.get(f"{BINANCE_API_BASE}/ticker/24hr", timeout=25)
+    r = requests.get(
+        f"{BINANCE_API_BASE}/ticker/24hr",
+        timeout=25,
+        headers=REQUEST_HEADERS,
+    )
     r.raise_for_status()
     data = r.json()
     out: List[Dict[str, Any]] = []
@@ -564,7 +575,18 @@ def get_spot_tickers_with_fallback() -> List[Dict[str, Any]]:
 def get_tw_universe(pool="TOP100"):
     try:
         url = "https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL"
-        data = requests.get(url, timeout=10).json()
+        try:
+            import certifi
+
+            verify = certifi.where()
+        except Exception:
+            verify = True
+        data = requests.get(
+            url,
+            timeout=15,
+            headers={"User-Agent": REQUEST_HEADERS["User-Agent"]},
+            verify=verify,
+        ).json()
         symbols = [item["Code"] + ".TW" for item in data if item["Code"].isdigit()]
     except Exception as e:
         print("❌ get_tw_universe failed:", repr(e))

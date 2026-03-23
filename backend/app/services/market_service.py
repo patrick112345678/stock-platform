@@ -19,6 +19,10 @@ from app.services.scanner_service import (
 # Bybit API 基本網址
 BYBIT_BASE_URL = "https://api.bybit.com"
 BINANCE_API_BASE = "https://api.binance.com/api/v3"
+REQUEST_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (compatible; StockPlatform/1.0)",
+    "Accept": "application/json",
+}
 
 # CoinMarketCap API Key（之後如果要抓 top100 可用）
 CMC_API_KEY = os.getenv("CMC_API_KEY")
@@ -79,7 +83,7 @@ def get_bybit_spot_symbols():
     url = f"{BYBIT_BASE_URL}/v5/market/instruments-info"
     params = {"category": "spot"}
 
-    resp = requests.get(url, params=params, timeout=10)
+    resp = requests.get(url, params=params, timeout=10, headers=REQUEST_HEADERS)
     resp.raise_for_status()
     data = resp.json()
 
@@ -95,6 +99,7 @@ def _binance_ticker_row(symbol: str) -> dict:
         f"{BINANCE_API_BASE}/ticker/24hr",
         params={"symbol": symbol},
         timeout=10,
+        headers=REQUEST_HEADERS,
     )
     r.raise_for_status()
     t = r.json()
@@ -118,7 +123,7 @@ def get_ticker(symbol: str):
         "symbol": symbol,
     }
     try:
-        resp = requests.get(url, params=params, timeout=10)
+        resp = requests.get(url, params=params, timeout=10, headers=REQUEST_HEADERS)
         resp.raise_for_status()
         data = resp.json()
         if data.get("retCode") != 0:
