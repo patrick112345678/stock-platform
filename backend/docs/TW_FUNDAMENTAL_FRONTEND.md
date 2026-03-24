@@ -1,5 +1,13 @@
 # 台股基本面 API（前端對照）
 
+## 資料來源（後端）
+
+- 台股基本面數值（PE/PB/EPS/ROE 等）優先自 **`stock_fundamentals`** 資料表讀取。
+- 列不存在或超過 **`FUNDAMENTAL_TTL_HOURS`**（預設 24h）時，才打 FinMind 並寫回 DB。
+- 每日背景任務會批次同步（見 `ENABLE_FUNDAMENTAL_DAILY_SYNC` / `FUNDAMENTAL_DAILY_SYNC_MAX`）。
+- **價格／K 線**仍走既有 `get_cached_stock_data`（記憶體快取，約 60s），與基本面分離。
+
+
 ## 統一結構 `fundamental`
 
 `GET` 詳情（`get_detail_data`）回傳中，台股會多一層 **`fundamental`**（與頂層 `pe` / `pb` / `roe` 等數值一致）：

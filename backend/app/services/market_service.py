@@ -14,11 +14,16 @@ from typing import List, Dict, Any, Optional, Literal
 
 from app.schemas.market import MarketCandleItem, MarketChartResponse
 from app.services.stock_data_service import get_cached_stock_data, get_cached_data, NEUTRAL_DATA_ERROR
-from app.services.fundamental_provider import (
-    fetch_tw_fundamental_bundle,
-    resolve_tw_display_name,
-)
+from app.services.fundamental_provider import resolve_tw_display_name
+from app.services.stock_fundamental_service import get_tw_fundamental_bundle_cached
 from app.services.technical_service import valuation_label
+from app.services.market_data_cache_service import (
+    get_or_refresh_crypto_kline_df,
+    get_or_refresh_crypto_quote,
+    get_or_refresh_stock_hist_df,
+    get_or_refresh_stock_quote,
+    try_read_fresh_stock_hist_from_chart_cache,
+)
 from app.services.scanner_service import (
     get_crypto_kline_with_fallback,
     get_tw_universe,
@@ -202,11 +207,13 @@ def build_crypto_quote_data(symbol: str):
             "previous_close": None,
             "change": None,
             "change_percent": None,
+            "volume": None,
         }
     exch = item.pop("_exchange", "BYBIT")
     last_price = safe_float(item.get("lastPrice"))
     prev_price_24h = safe_float(item.get("prevPrice24h"))
     price_24h_pcnt = safe_float(item.get("price24hPcnt"))
+    vol = safe_float(item.get("volume24h") or item.get("turnover24h"))
     change = None
     if last_price is not None and prev_price_24h is not None:
         change = round(last_price - prev_price_24h, 8)
@@ -222,6 +229,7 @@ def build_crypto_quote_data(symbol: str):
         "previous_close": round(prev_price_24h, 8) if prev_price_24h is not None else None,
         "change": change,
         "change_percent": change_percent,
+        "volume": vol,
     }
 
 
@@ -305,7 +313,8 @@ def get_quote_data(symbol: str, market: str = "stock"):
 
     if market == "crypto":
         try:
-            return build_crypto_quote_data(raw_symbol)
+            sym = normalize_crypto_symbol(raw_symbol)
+            return get_or_refresh_crypto_quote(sym, lambda: build_crypto_quote_data(raw_symbol))
         except Exception as e:
             print("WARN get_quote_data crypto:", repr(e))
             sym = normalize_crypto_symbol(raw_symbol)
@@ -321,7 +330,13 @@ def get_quote_data(symbol: str, market: str = "stock"):
             }
 
     try:
-        return _get_quote_data_stock(raw_symbol, market)
+        stock_symbol = normalize_stock_symbol(raw_symbol)
+        mkt = detect_stock_market(stock_symbol)
+        return get_or_refresh_stock_quote(
+            stock_symbol,
+            mkt,
+            lambda: _fetch_quote_stock_live(raw_symbol, market),
+        )
     except Exception as e:
         print("WARN get_quote_data:", repr(e))
         stock_symbol = normalize_stock_symbol(raw_symbol)
@@ -337,16 +352,24 @@ def get_quote_data(symbol: str, market: str = "stock"):
         }
 
 
-def _get_quote_data_stock(raw_symbol: str, _market: str) -> Dict[str, Any]:
-    stock_symbol = normalize_stock_symbol(raw_symbol)
-    bundle = get_cached_data(stock_symbol)
-    prov = bundle.get("provider")
-    if bundle.get("ok"):
-        print(f"[quote] hist provider={prov} symbol={stock_symbol}")
-    else:
-        print(f"[quote] hist failed symbol={stock_symbol} err={bundle.get('error')!r}")
+def _fetch_hist_bundle_for_symbol(yf_symbol: str) -> Optional[pd.DataFrame]:
+    bundle = get_cached_data(yf_symbol)
+    return bundle.get("hist") if bundle.get("ok") else None
 
-    hist = bundle.get("hist") if bundle.get("ok") else None
+
+def _fetch_quote_stock_live(raw_symbol: str, _market: str) -> Dict[str, Any]:
+    stock_symbol = normalize_stock_symbol(raw_symbol)
+    mkt = detect_stock_market(stock_symbol)
+    hist = try_read_fresh_stock_hist_from_chart_cache(stock_symbol, mkt)
+    bundle = None
+    if hist is None:
+        bundle = get_cached_data(stock_symbol)
+        prov = bundle.get("provider")
+        if bundle.get("ok"):
+            print(f"[quote] hist provider={prov} symbol={stock_symbol}")
+        else:
+            print(f"[quote] hist failed symbol={stock_symbol} err={bundle.get('error')!r}")
+        hist = bundle.get("hist") if bundle.get("ok") else None
 
     current_price = None
     previous_close = None
@@ -379,6 +402,10 @@ def _get_quote_data_stock(raw_symbol: str, _market: str) -> Dict[str, Any]:
     else:
         display_name = tw_name or stock_symbol
 
+    vol = None
+    if hist is not None and not hist.empty and "Volume" in hist.columns:
+        vol = safe_float(hist["Volume"].iloc[-1])
+
     if current_price is None:
         return {
             "symbol": stock_symbol,
@@ -389,6 +416,7 @@ def _get_quote_data_stock(raw_symbol: str, _market: str) -> Dict[str, Any]:
             "previous_close": previous_close,
             "change": None,
             "change_percent": None,
+            "volume": vol,
         }
 
     change = None
@@ -406,6 +434,7 @@ def _get_quote_data_stock(raw_symbol: str, _market: str) -> Dict[str, Any]:
         "previous_close": round(previous_close, 4) if previous_close is not None else None,
         "change": change,
         "change_percent": change_percent,
+        "volume": vol,
     }
 
 
@@ -415,7 +444,8 @@ def get_detail_data(symbol: str, market: str = "stock"):
 
     if market == "crypto":
         try:
-            quote = build_crypto_quote_data(raw_symbol)
+            sym_c = normalize_crypto_symbol(raw_symbol)
+            quote = get_or_refresh_crypto_quote(sym_c, lambda: build_crypto_quote_data(raw_symbol))
         except Exception as e:
             print("WARN get_detail_data crypto:", repr(e))
             sym = normalize_crypto_symbol(raw_symbol)
@@ -480,8 +510,14 @@ def get_detail_data(symbol: str, market: str = "stock"):
 
     try:
         stock_symbol = normalize_stock_symbol(raw_symbol)
-        bundle = get_cached_data(stock_symbol)
-        hist = bundle.get("hist") if bundle.get("ok") else None
+        mkt = str(market).strip().upper()
+        if mkt not in ("TW", "US"):
+            mkt = detect_stock_market(stock_symbol)
+        hist = get_or_refresh_stock_hist_df(
+            stock_symbol,
+            mkt,
+            lambda: _fetch_hist_bundle_for_symbol(stock_symbol),
+        )
 
         quote = get_quote_data(symbol, market)
         market_label = "台股/櫃買" if stock_symbol.endswith((".TW", ".TWO")) or raw_symbol.isdigit() else "海外/其他"
@@ -494,10 +530,8 @@ def get_detail_data(symbol: str, market: str = "stock"):
             quality = "部分"
 
         errors: List[str] = []
-        if not bundle.get("ok"):
-            err = bundle.get("error")
-            if err:
-                errors.append(str(err))
+        if hist is None or hist.empty:
+            errors.append(NEUTRAL_DATA_ERROR)
 
         code = stock_symbol.replace(".TW", "").replace(".TWO", "").strip()
         is_tw = stock_symbol.endswith((".TW", ".TWO")) or raw_symbol.isdigit()
@@ -505,7 +539,7 @@ def get_detail_data(symbol: str, market: str = "stock"):
         fund = None
         fundamental: Optional[dict[str, Any]] = None
         if is_tw and code.isdigit():
-            fund = fetch_tw_fundamental_bundle(code)
+            fund = get_tw_fundamental_bundle_cached(stock_symbol)
             tw_fb = qn if qn and qn != stock_symbol else None
             if fund.get("stock_name_zh"):
                 detail_name = str(fund.get("display_name") or "").strip() or resolve_tw_display_name(
@@ -640,9 +674,16 @@ def map_chart_interval_to_bybit(interval: str) -> str:
 def build_crypto_chart_data(symbol: str, interval: str, period: str):
     symbol = normalize_crypto_symbol(symbol)
     bybit_interval = map_chart_interval_to_bybit(interval)
-    try:
-        df, _exch = get_crypto_kline_with_fallback(symbol, bybit_interval, 200)
-    except Exception:
+
+    def fetch_df():
+        try:
+            df, _exch = get_crypto_kline_with_fallback(symbol, bybit_interval, 200)
+            return df
+        except Exception:
+            return pd.DataFrame()
+
+    df = get_or_refresh_crypto_kline_df(symbol, interval, fetch_df)
+    if df is None or df.empty:
         return MarketChartResponse(symbol=symbol, interval=interval, period=period, candles=[])
 
     candles = []
@@ -676,9 +717,16 @@ def build_crypto_chart_data(symbol: str, interval: str, period: str):
 def build_crypto_market_data(symbol: str, interval: str = "1d") -> dict:
     symbol = normalize_crypto_symbol(symbol)
     bybit_interval = map_chart_interval_to_bybit(interval)
-    try:
-        df, _exch = get_crypto_kline_with_fallback(symbol, bybit_interval, 200)
-    except Exception:
+
+    def fetch_df():
+        try:
+            df, _exch = get_crypto_kline_with_fallback(symbol, bybit_interval, 200)
+            return df
+        except Exception:
+            return pd.DataFrame()
+
+    df = get_or_refresh_crypto_kline_df(symbol, interval, fetch_df)
+    if df is None or df.empty:
         return {
             "raw_symbol": symbol,
             "name": symbol,
@@ -732,8 +780,12 @@ def get_chart_data(symbol: str, interval: str, period: str):
 
 def _get_chart_data_stock(raw_symbol: str, interval: str, period: str) -> MarketChartResponse:
     sym = normalize_stock_symbol(raw_symbol)
-    bundle = get_cached_data(sym)
-    hist = bundle.get("hist") if bundle.get("ok") else None
+    mkt = detect_stock_market(sym)
+    hist = get_or_refresh_stock_hist_df(
+        sym,
+        mkt,
+        lambda: _fetch_hist_bundle_for_symbol(sym),
+    )
     if hist is None or hist.empty:
         return MarketChartResponse(symbol=sym, interval=interval, period=period, candles=[])
 
@@ -786,8 +838,11 @@ def get_market_data(symbol: str, market: str = "US", interval: str = "1d", perio
         else:
             yf_symbol = raw_symbol
 
-        bundle = get_cached_data(yf_symbol)
-        hist = bundle.get("hist") if bundle.get("ok") else None
+        hist = get_or_refresh_stock_hist_df(
+            yf_symbol,
+            market_upper,
+            lambda: _fetch_hist_bundle_for_symbol(yf_symbol),
+        )
 
         if hist is None or hist.empty:
             return {
@@ -863,7 +918,7 @@ def get_market_data(symbol: str, market: str = "US", interval: str = "1d", perio
 
         if market_upper == "TW":
             code = yf_symbol.replace(".TW", "").replace(".TWO", "").strip()
-            b = fetch_tw_fundamental_bundle(code)
+            b = get_tw_fundamental_bundle_cached(yf_symbol)
             pe_v = b.get("pe")
             pb_v = b.get("pb")
             eps_v = b.get("eps")
@@ -873,12 +928,6 @@ def get_market_data(symbol: str, market: str = "US", interval: str = "1d", perio
             debt_v = b.get("debt_ratio")
             ind_v = b.get("industry")
             snap_name = None
-            try:
-                snap = fetch_tw_mis_snapshot(yf_symbol)
-                if snap:
-                    snap_name = snap.get("name")
-            except Exception:
-                pass
             if b.get("stock_name_zh"):
                 display_name = str(b.get("display_name") or "").strip() or resolve_tw_display_name(
                     code, fallback_zh=snap_name

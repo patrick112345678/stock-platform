@@ -31,6 +31,7 @@ from app.services.scanner_service import (
     save_scanner_results,
     is_scanner_cache_recent,
 )
+from app.services.stock_fundamental_service import run_tw_fundamentals_daily_sync
 
 
 def _init_db_sync() -> None:
@@ -59,6 +60,7 @@ async def _delayed_background_jobs() -> None:
         return
     asyncio.create_task(scanner_background_job())
     asyncio.create_task(scanner_cache_10min_job())
+    asyncio.create_task(tw_fundamentals_background_job())
     print("🟢 background scanner tasks scheduled")
 
 
@@ -103,6 +105,23 @@ app.include_router(watchlist_router)
 app.include_router(ai_router)
 app.include_router(scanner_router)
 app.include_router(payment_router)
+
+
+# =========================
+# 📊 台股基本面（DB 日同步）
+# =========================
+async def tw_fundamentals_background_job():
+    """每 24h 同步一次 stock_fundamentals；啟動後先延遲再跑，避免與 DB init 撞車。"""
+    await asyncio.sleep(45)
+    while True:
+        if os.getenv("ENABLE_FUNDAMENTAL_DAILY_SYNC", "true").lower() not in ("1", "true", "yes", "on"):
+            await asyncio.sleep(3600)
+            continue
+        try:
+            await asyncio.to_thread(run_tw_fundamentals_daily_sync)
+        except Exception as e:
+            print("🔴 tw_fundamentals_daily_sync:", repr(e))
+        await asyncio.sleep(86400)
 
 
 # =========================

@@ -23,11 +23,6 @@ _STOCK_INFO_MAP: dict[str, str] | None = None
 _STOCK_INFO_TS: float = 0.0
 _STOCK_INFO_TTL = 86400.0
 
-# 完整基本面快取（含財報／月營收）
-_FUND_FULL_CACHE: dict[str, tuple[float, dict[str, Any]]] = {}
-_FUND_TTL = 3600.0
-
-
 def _get_verify():
     try:
         import certifi
@@ -324,13 +319,6 @@ def fetch_tw_fundamental_bundle(stock_code: str) -> dict[str, Any]:
     if not code.isdigit():
         return empty
 
-    now = time.monotonic()
-    ck = f"full_fund::{code}"
-    if ck in _FUND_FULL_CACHE:
-        ts, cached = _FUND_FULL_CACHE[ck]
-        if now - ts < _FUND_TTL:
-            return dict(cached)
-
     end = datetime.now().date()
     start_market = end - timedelta(days=400)
     start_fin = end - timedelta(days=1200)
@@ -390,7 +378,6 @@ def fetch_tw_fundamental_bundle(stock_code: str) -> dict[str, Any]:
     rev_rows = _load_dataset_rows("TaiwanStockMonthRevenue", code, start_month, end)
     out["revenue_growth_yoy"] = _month_revenue_yoy(rev_rows)
 
-    _FUND_FULL_CACHE[ck] = (now, dict(out))
     return out
 
 

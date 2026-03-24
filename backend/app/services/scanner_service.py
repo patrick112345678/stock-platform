@@ -1,7 +1,9 @@
 import math
+import os
+import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from io import StringIO
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 
 import pandas as pd
 import requests
@@ -41,6 +43,84 @@ SCANNER_UNIVERSE_MAX = 30
 
 US_SYMBOLS_CACHE = None
 US_SEARCH_CACHE: List[Dict[str, str]] | None = None
+
+_watchlist_symbol_locks: dict[str, threading.Lock] = {}
+_watchlist_symbol_locks_guard = threading.Lock()
+
+
+def _watchlist_lock(symbol: str, market: str) -> threading.Lock:
+    k = f"{market}:{symbol}"
+    with _watchlist_symbol_locks_guard:
+        if k not in _watchlist_symbol_locks:
+            _watchlist_symbol_locks[k] = threading.Lock()
+        return _watchlist_symbol_locks[k]
+
+
+def _parse_scanner_row_dict(item: Dict[str, Any]) -> Dict[str, Any]:
+    item = dict(item)
+    if item.get("signals"):
+        try:
+            item["signals"] = json.loads(item["signals"])
+        except Exception:
+            item["signals"] = []
+    else:
+        item["signals"] = []
+
+    if item.get("extra"):
+        try:
+            extra = json.loads(item["extra"])
+            item["volume_ratio_30d"] = extra.get("volume_ratio_30d")
+            item["breakout_30d"] = extra.get("breakout_30d")
+            item["macd_golden"] = extra.get("macd_golden")
+            item["macd_death"] = extra.get("macd_death")
+            item["rsi"] = extra.get("rsi")
+            item["support"] = extra.get("support")
+            item["resistance"] = extra.get("resistance")
+            item["trend"] = extra.get("trend")
+            item["pattern"] = extra.get("pattern")
+        except Exception:
+            pass
+    item.pop("extra", None)
+
+    if item.get("change") is None and item.get("price") is not None and item.get("change_percent") is not None:
+        cp = item["change_percent"]
+        item["change"] = round(item["price"] * cp / (100 + cp), 4) if (100 + cp) != 0 else 0
+    item.setdefault("trend", None)
+    item.setdefault("pattern", "暫無明確型態")
+    item.setdefault("funding_rate", None)
+    return item
+
+
+def _scanner_row_fresh(item: Dict[str, Any], minutes: Optional[int] = None) -> bool:
+    try:
+        m = minutes if minutes is not None else int(os.getenv("SCANNER_CACHE_TTL_MINUTES", "10"))
+    except ValueError:
+        m = 10
+    u = item.get("updated_at")
+    if u is None:
+        return False
+    try:
+        return datetime.utcnow() - u < timedelta(minutes=m)
+    except Exception:
+        return False
+
+
+def get_scanner_cache_row(symbol: str, market: str) -> Optional[Dict[str, Any]]:
+    db = SessionLocal()
+    try:
+        _ensure_scanner_cache_table(db)
+        _ensure_scanner_extra_column(db)
+        row = db.execute(
+            text("SELECT * FROM scanner_cache WHERE symbol = :s AND market = :m"),
+            {"s": symbol, "m": market},
+        ).fetchone()
+        if not row:
+            return None
+        return _parse_scanner_row_dict(dict(row._mapping))
+    finally:
+        db.close()
+
+
 def get_cached_results(market, limit):
     db = SessionLocal()
     try:
@@ -57,38 +137,7 @@ def get_cached_results(market, limit):
 
         results = []
         for row in rows:
-            item = dict(row._mapping)
-
-            if item.get("signals"):
-                try:
-                    item["signals"] = json.loads(item["signals"])
-                except Exception:
-                    item["signals"] = []
-            else:
-                item["signals"] = []
-
-            if item.get("extra"):
-                try:
-                    extra = json.loads(item["extra"])
-                    item["volume_ratio_30d"] = extra.get("volume_ratio_30d")
-                    item["breakout_30d"] = extra.get("breakout_30d")
-                    item["macd_golden"] = extra.get("macd_golden")
-                    item["macd_death"] = extra.get("macd_death")
-                    item["rsi"] = extra.get("rsi")
-                    item["support"] = extra.get("support")
-                    item["resistance"] = extra.get("resistance")
-                    item["trend"] = extra.get("trend")
-                    item["pattern"] = extra.get("pattern")
-                except Exception:
-                    pass
-            item.pop("extra", None)
-
-            if item.get("change") is None and item.get("price") is not None and item.get("change_percent") is not None:
-                cp = item["change_percent"]
-                item["change"] = round(item["price"] * cp / (100 + cp), 4) if (100 + cp) != 0 else 0
-            item.setdefault("trend", None)
-            item.setdefault("pattern", "暫無明確型態")
-            item.setdefault("funding_rate", None)
+            item = _parse_scanner_row_dict(dict(row._mapping))
             results.append(item)
 
         return enrich_tw_names(results, market)
@@ -858,8 +907,13 @@ def build_opportunity_from_df(
 
 def process_us_symbol(symbol: str):
     try:
-        df = get_stock_hist(symbol)
-        return build_opportunity_from_df(
+        from app.services.market_data_cache_service import (
+            upsert_chart_from_scanner_df,
+            upsert_price_from_scanner_item,
+        )
+
+        df = get_stock_hist(symbol, period="2y")
+        item = build_opportunity_from_df(
             df=df,
             symbol=symbol,
             market="US",
@@ -867,16 +921,25 @@ def process_us_symbol(symbol: str):
             display_symbol=symbol,
             min_bars=60,
         )
+        if item:
+            upsert_price_from_scanner_item(item, "US")
+            upsert_chart_from_scanner_df(df, item["symbol"], "US")
+        return item
     except Exception as e:
         return None
 
 def process_tw_symbol(yf_symbol: str):
     try:
-        df = get_stock_hist(yf_symbol)
+        from app.services.market_data_cache_service import (
+            upsert_chart_from_scanner_df,
+            upsert_price_from_scanner_item,
+        )
+
+        df = get_stock_hist(yf_symbol, period="2y")
         code = yf_symbol.replace(".TW", "").replace(".TWO", "").strip()
         tw_map = get_tw_symbol_to_name()
         disp_name = tw_map.get(code)
-        return build_opportunity_from_df(
+        item = build_opportunity_from_df(
             df=df,
             symbol=yf_symbol,
             market="TW",
@@ -885,13 +948,22 @@ def process_tw_symbol(yf_symbol: str):
             display_name=disp_name,
             min_bars=60,
         )
+        if item:
+            upsert_price_from_scanner_item(item, "TW")
+            upsert_chart_from_scanner_df(df, item["symbol"], "TW")
+        return item
     except Exception as e:
         return None
 
 def process_crypto_symbol(symbol: str):
     try:
+        from app.services.market_data_cache_service import (
+            upsert_chart_from_scanner_df,
+            upsert_price_from_scanner_item,
+        )
+
         df, exch = get_crypto_kline_with_fallback(symbol)
-        return build_opportunity_from_df(
+        item = build_opportunity_from_df(
             df=df,
             symbol=symbol,
             market="CRYPTO",
@@ -899,6 +971,10 @@ def process_crypto_symbol(symbol: str):
             display_symbol=symbol,
             min_bars=40,
         )
+        if item:
+            upsert_price_from_scanner_item(item, "CRYPTO")
+            upsert_chart_from_scanner_df(df, item["symbol"], "CRYPTO")
+        return item
     except Exception as e:
         return None
 
@@ -1061,12 +1137,22 @@ def get_opportunities(market: str = "US", pool: str = "TOP100", limit: int = 20)
         return get_us_opportunities(limit)
 
 
+def _watchlist_scanner_symbol(symbol: str, item_market: str) -> str:
+    s = str(symbol).strip().upper()
+    if item_market == "TW":
+        return s if s.endswith(".TW") else f"{s}.TW"
+    if item_market == "CRYPTO":
+        sym = s.replace("-", "").replace(" ", "")
+        return sym if sym.endswith("USDT") else f"{sym}USDT"
+    return s
+
+
 def get_watchlist_opportunities(
     watchlist_items: List[Dict[str, Any]],
     market: str,
     limit: int = 50,
 ) -> List[Dict[str, Any]]:
-    """針對自選股清單逐一取得技術分析結果"""
+    """優先讀 scanner_cache；無資料或過期才即時掃描，且同一 symbol 單飛避免重複打外部 API。"""
     results = []
     market = market.upper()
 
@@ -1078,21 +1164,32 @@ def get_watchlist_opportunities(
         if not symbol:
             continue
 
+        cache_sym = _watchlist_scanner_symbol(symbol, item_market)
+
         try:
-            if item_market == "TW":
-                yf_symbol = symbol if symbol.endswith(".TW") else f"{symbol}.TW"
-                res = process_tw_symbol(yf_symbol)
-            elif item_market == "US":
-                res = process_us_symbol(symbol)
-            elif item_market == "CRYPTO":
-                sym = symbol.replace("-", "").replace(" ", "")
-                if not sym.endswith("USDT"):
-                    sym = f"{sym}USDT"
-                res = process_crypto_symbol(sym)
-            else:
+            cached = get_scanner_cache_row(cache_sym, item_market)
+            if cached and _scanner_row_fresh(cached):
+                results.append(cached)
                 continue
-            if res:
-                results.append(res)
+
+            lk = _watchlist_lock(cache_sym, item_market)
+            with lk:
+                cached = get_scanner_cache_row(cache_sym, item_market)
+                if cached and _scanner_row_fresh(cached):
+                    results.append(cached)
+                    continue
+
+                if item_market == "TW":
+                    res = process_tw_symbol(cache_sym)
+                elif item_market == "US":
+                    res = process_us_symbol(symbol)
+                elif item_market == "CRYPTO":
+                    res = process_crypto_symbol(cache_sym)
+                else:
+                    continue
+                if res:
+                    save_scanner_results([res], item_market)
+                    results.append(res)
         except Exception:
             pass
 
