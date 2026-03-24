@@ -1,14 +1,15 @@
 """
-台股上市：TWSE OpenAPI 日線（STOCK_DAY）為主資料來源之一。
+TWSE OpenAPI：可選備援（Render 等環境常回 HTML，預設關閉）。
 
-嚴禁對回應直接呼叫 response.json()：一律先檢查 status、Content-Type、body，
-再以 utf-8 解碼後 json.loads；失敗時寫結構化單行 log（含 url、body 前 200 字）。
+環境變數 ENABLE_TWSE_OPENAPI=true 才會發送 HTTP；否則立即跳過，不產生失敗 log。
+硬性規則：Content-Type 須含 application/json，且 body 不得為 HTML，否則視為 provider_unavailable，不嘗試 json.loads。
 """
 
 from __future__ import annotations
 
 import json
 import logging
+import os
 from datetime import datetime
 from typing import Any, List, Optional
 from urllib.parse import urlencode
@@ -21,7 +22,7 @@ logger = logging.getLogger(__name__)
 REQUEST_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-    "Accept": "application/json, text/plain, */*",
+    "Accept": "application/json",
     "Accept-Language": "zh-TW,zh;q=0.9,en;q=0.8",
 }
 EXTERNAL_REQUEST_TIMEOUT = 15.0
@@ -30,6 +31,11 @@ TWSE_STOCK_DAY_URL = "https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY"
 TWSE_STOCK_DAY_ALL_URL = "https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL"
 
 TWSE_PROVIDER = "TWSE_OPENAPI"
+
+
+def is_twse_openapi_enabled() -> bool:
+    """預設 false；設為 1/true/yes/on 才啟用 TWSE HTTP。"""
+    return os.getenv("ENABLE_TWSE_OPENAPI", "false").lower() in ("1", "true", "yes", "on")
 
 
 def _get_verify():
@@ -44,12 +50,10 @@ def _get_verify():
 def _build_url_for_log(url: str, params: dict[str, Any]) -> str:
     if not params:
         return url
-    q = urlencode(params, doseq=True)
-    return f"{url}?{q}"
+    return f"{url}?{urlencode(params, doseq=True)}"
 
 
 def _decode_response_body(raw_bytes: bytes) -> str:
-    """TWSE 回傳應為 UTF-8；避免 requests 誤判 encoding 造成亂碼與 json.loads 失敗。"""
     if not raw_bytes:
         return ""
     for enc in ("utf-8-sig", "utf-8", "big5"):
@@ -60,31 +64,37 @@ def _decode_response_body(raw_bytes: bytes) -> str:
     return raw_bytes.decode("utf-8", errors="replace")
 
 
-def _body_looks_like_json(text: str) -> bool:
-    s = text.lstrip("\ufeff \t\r\n")
-    return s.startswith("{") or s.startswith("[")
+def _body_head(text: str, n: int = 120) -> str:
+    return text[:n].replace("\r\n", " ").replace("\n", " ")
 
 
-def _content_type_allows_json_parsing(content_type: str, body: str) -> tuple[bool, str]:
+def _twse_json_eligible(ct_raw: str, body: str) -> tuple[bool, str]:
     """
-    若明確為 HTML 則拒絕。
-    application/json、text/plain（且內容像 JSON）、空 content-type 但內容像 JSON → 允許。
-    回傳 (allowed, reason_code)
+    硬性檢查：非 application/json → 不可用。
+    HTML 開頭 → 不可用（不再做 json parsing）。
     """
-    ct = (content_type or "").split(";")[0].strip().lower()
-    if "text/html" in content_type.lower():
-        return False, "content_type_html"
-    if "application/json" in content_type.lower() or "text/json" in content_type.lower():
-        return True, "content_type_json"
-    if "application/javascript" in content_type.lower():
-        return True, "content_type_js"
-    if ct in ("text/plain", "") or "charset" in content_type.lower():
-        if _body_looks_like_json(body):
-            return True, "content_type_plain_but_json_shape"
-        return False, "content_type_plain_not_json"
-    if _body_looks_like_json(body):
-        return True, "content_type_unusual_but_json_shape"
-    return False, f"content_type_rejected:{ct or 'empty'}"
+    ct = (ct_raw or "").lower()
+    if "application/json" not in ct:
+        return False, "not_application_json"
+    b = body.lstrip("\ufeff \t\r\n")
+    bl = b.lower()
+    if bl.startswith("<!doctype html") or bl.startswith("<html"):
+        return False, "html_body"
+    if "<html" in bl[:50]:
+        return False, "html_body"
+    return True, "ok"
+
+
+def _twse_log_unavailable(symbol: str, status: int, ct_raw: str, body: str, reason: str) -> None:
+    logger.warning(
+        "provider=%s symbol=%s status=%s content_type=%s body_head=%s reason=%s",
+        TWSE_PROVIDER,
+        symbol,
+        status,
+        (ct_raw or "(none)")[:80],
+        _body_head(body),
+        reason,
+    )
 
 
 def twse_safe_get_json(
@@ -94,10 +104,12 @@ def twse_safe_get_json(
     stock_no: str,
 ) -> tuple[dict | list | None, Optional[str]]:
     """
-    禁止 response.json()。成功 (parsed, None)；失敗 (None, short_reason)。
-
-    short_reason: http_NNN, empty_body, provider_content_type, json_parse_failed, ssl_failed, request_error
+    禁止 response.json()。未通過硬性檢查前不呼叫 json.loads。
+    失敗碼：twse_disabled, provider_unavailable, http_NNN, empty_body, json_parse_failed, ssl_failed, request_error
     """
+    if not is_twse_openapi_enabled():
+        return None, "twse_disabled"
+
     url_preview = _build_url_for_log(url, params)
 
     for attempt_idx, use_verify in enumerate([_get_verify(), False]):
@@ -117,80 +129,31 @@ def twse_safe_get_json(
             status = r.status_code
             ct_raw = r.headers.get("Content-Type") or ""
             final_url = getattr(r, "url", None) or url_preview
-
             raw_bytes = r.content if r.content is not None else b""
-            body_preview = _decode_response_body(raw_bytes)[:200].replace("\r\n", " ").replace("\n", " ")
-
-            # TWSE 有時回 HTTP 200 但導向 404.html（或路徑含 /404）
-            if "404.html" in final_url.lower() or final_url.rstrip("/").lower().endswith("/404"):
-                logger.warning(
-                    "provider=%s symbol=%s url=%s status=%s content_type=%s note=soft_404_url body_head=%s",
-                    TWSE_PROVIDER,
-                    stock_no,
-                    final_url,
-                    status,
-                    ct_raw or "(none)",
-                    body_preview,
-                )
-                return None, "twse_soft_404"
-
-            body = _decode_response_body(raw_bytes)
-            body = body.lstrip("\ufeff")
-            snippet = body[:200].replace("\r\n", " ").replace("\n", " ")
+            body = _decode_response_body(raw_bytes).lstrip("\ufeff")
 
             if status != 200:
-                logger.warning(
-                    "provider=%s symbol=%s url=%s status=%s content_type=%s body_head=%s",
-                    TWSE_PROVIDER,
-                    stock_no,
-                    final_url,
-                    status,
-                    ct_raw or "(none)",
-                    snippet,
-                )
+                _twse_log_unavailable(stock_no, status, ct_raw, body, "http_not_200")
                 return None, f"http_{status}"
 
             if not body.strip():
-                logger.warning(
-                    "provider=%s symbol=%s url=%s status=%s content_type=%s body_head=%s",
-                    TWSE_PROVIDER,
-                    stock_no,
-                    final_url,
-                    status,
-                    ct_raw or "(none)",
-                    "(empty)",
-                )
+                _twse_log_unavailable(stock_no, status, ct_raw, body, "empty_body")
                 return None, "empty_body"
 
-            allowed, ctype_reason = _content_type_allows_json_parsing(ct_raw, body)
-            if not allowed:
-                logger.warning(
-                    "provider=%s symbol=%s url=%s status=%s content_type=%s ctype_check=%s body_head=%s",
-                    TWSE_PROVIDER,
-                    stock_no,
-                    final_url,
-                    status,
-                    ct_raw or "(none)",
-                    ctype_reason,
-                    snippet,
-                )
-                return None, "provider_content_type"
+            if "404.html" in final_url.lower() or final_url.rstrip("/").lower().endswith("/404"):
+                _twse_log_unavailable(stock_no, status, ct_raw, body, "soft_404_url")
+                return None, "twse_soft_404"
+
+            ok_elig, elig_reason = _twse_json_eligible(ct_raw, body)
+            if not ok_elig:
+                _twse_log_unavailable(stock_no, status, ct_raw, body, elig_reason)
+                return None, "provider_unavailable"
 
             try:
                 parsed: dict | list = json.loads(body)
-            except json.JSONDecodeError as e:
-                logger.warning(
-                    "provider=%s symbol=%s url=%s status=%s content_type=%s "
-                    "json_error=%s pos=%s body_head=%s",
-                    TWSE_PROVIDER,
-                    stock_no,
-                    final_url,
-                    status,
-                    ct_raw or "(none)",
-                    str(e).replace("\n", " ")[:120],
-                    getattr(e, "pos", None),
-                    snippet,
-                )
+            except json.JSONDecodeError:
+                # 僅在已宣告 JSON 且非 HTML 時仍解析失敗
+                _twse_log_unavailable(stock_no, status, ct_raw, body, "json_parse_failed")
                 return None, "json_parse_failed"
 
             return parsed, None
@@ -198,28 +161,25 @@ def twse_safe_get_json(
         except requests.exceptions.SSLError as e:
             if attempt_idx == 0:
                 logger.warning(
-                    "provider=%s symbol=%s url=%s ssl_verify_failed err=%s (retry_insecure)",
+                    "provider=%s symbol=%s ssl_retry_insecure err=%s",
                     TWSE_PROVIDER,
                     stock_no,
-                    url_preview,
-                    str(e)[:160],
+                    str(e)[:100],
                 )
                 continue
             logger.warning(
-                "provider=%s symbol=%s url=%s ssl_failed err=%s",
+                "provider=%s symbol=%s ssl_failed err=%s",
                 TWSE_PROVIDER,
                 stock_no,
-                url_preview,
-                str(e)[:200],
+                str(e)[:120],
             )
             return None, "ssl_failed"
         except requests.RequestException as e:
             logger.warning(
-                "provider=%s symbol=%s url=%s request_error err=%s",
+                "provider=%s symbol=%s request_err=%s",
                 TWSE_PROVIDER,
                 stock_no,
-                url_preview,
-                str(e)[:200],
+                str(e)[:120],
             )
             return None, "request_error"
 
@@ -255,7 +215,6 @@ def _parse_num(val) -> Optional[float]:
 
 
 def _fetch_twse_stock_day_month(stock_no: str, year: int, month: int) -> List[List[Any]]:
-    """單月 STOCK_DAY；失敗或非上市檔回傳空 list。"""
     date_str = f"{year}{month:02d}01"
     raw, err = twse_safe_get_json(
         TWSE_STOCK_DAY_URL,
@@ -279,10 +238,9 @@ def _fetch_twse_stock_day_month(stock_no: str, year: int, month: int) -> List[Li
 
 
 def fetch_tw_daily_history_official(stock_no: str, months_back: int = 6) -> Optional[pd.DataFrame]:
-    """
-    自 TWSE OpenAPI 拉取最近數月日線，組成與 yfinance 相容的 OHLCV DataFrame（index: DatetimeIndex）。
-    僅適用 **上市** 普通股；上櫃／興櫃若 TWSE 無檔會回傳 None。
-    """
+    if not is_twse_openapi_enabled():
+        return None
+
     code = str(stock_no).replace(".TW", "").replace(".TWO", "").strip()
     if not code.isdigit():
         return None
@@ -317,11 +275,10 @@ def fetch_tw_daily_history_official(stock_no: str, months_back: int = 6) -> Opti
         i_close = fields.index("收盤價")
     except ValueError:
         logger.warning(
-            "provider=%s symbol=%s url=%s unexpected_fields=%s",
+            "provider=%s symbol=%s body_head=%s reason=unexpected_fields",
             TWSE_PROVIDER,
             code,
-            TWSE_STOCK_DAY_URL,
-            fields,
+            str(fields)[:120],
         )
         return None
 
@@ -361,10 +318,9 @@ def fetch_tw_daily_history_official(stock_no: str, months_back: int = 6) -> Opti
 
 
 def fetch_twse_stock_day_all_rows() -> tuple[List[Dict[str, Any]], Optional[str]]:
-    """
-    STOCK_DAY_ALL 全表；供 /market/search 與 scanner 搜尋清單。
-    回傳 (rows, None) 或 ([], error_reason)。
-    """
+    if not is_twse_openapi_enabled():
+        return [], "twse_disabled"
+
     raw, err = twse_safe_get_json(
         TWSE_STOCK_DAY_ALL_URL,
         {},
@@ -377,9 +333,8 @@ def fetch_twse_stock_day_all_rows() -> tuple[List[Dict[str, Any]], Optional[str]
         st = raw.get("stat")
         if st and st != "OK":
             logger.warning(
-                "provider=%s symbol=STOCK_DAY_ALL url=%s stat=%s",
+                "provider=%s symbol=STOCK_DAY_ALL status=200 reason=stat_%s",
                 TWSE_PROVIDER,
-                TWSE_STOCK_DAY_ALL_URL,
                 st,
             )
             return [], "stat_not_ok"
@@ -403,4 +358,5 @@ __all__ = [
     "TWSE_PROVIDER",
     "twse_safe_get_json",
     "fetch_twse_stock_day_all_rows",
+    "is_twse_openapi_enabled",
 ]

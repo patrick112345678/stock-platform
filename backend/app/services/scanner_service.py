@@ -575,12 +575,12 @@ def get_spot_tickers_with_fallback() -> List[Dict[str, Any]]:
 
 
 def _fetch_twse_stock_day_all() -> List[Dict[str, Any]]:
-    """拉取 TWSE OpenAPI STOCK_DAY_ALL；HTTP/JSON 處理與 twse_official_service 一致。"""
+    """拉取 TWSE STOCK_DAY_ALL；ENABLE_TWSE_OPENAPI=false 時不發請求。"""
     from app.services.twse_official_service import fetch_twse_stock_day_all_rows
 
     rows, err = fetch_twse_stock_day_all_rows()
-    if err:
-        print(f"[scanner] TWSE STOCK_DAY_ALL provider failure: {err}")
+    if err and err != "twse_disabled":
+        print(f"[scanner] TWSE STOCK_DAY_ALL skip_or_fail: {err}")
     return rows or []
 
 
@@ -645,6 +645,9 @@ def get_tw_search_items() -> List[Dict[str, str]]:
             if code:
                 display_symbol = str(code).strip()
                 items.append({"symbol": display_symbol, "name": (name or display_symbol).strip()})
+        if not items:
+            TW_SEARCH_CACHE = _load_tw_stock_master_fallback()
+            return TW_SEARCH_CACHE
         TW_SEARCH_CACHE = items
         return items
     except Exception as e:

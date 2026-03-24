@@ -1,9 +1,10 @@
 """
 股票資料統一入口：依市場分流資料源，並以記憶體快取 60 秒。
 
-* 台股 TW：優先 TWSE OpenAPI 日線，失敗再備援 Yahoo Finance（yfinance）。
-* 美股 US：目前主實作為 Yahoo Finance（見 us_stock_provider，可替換為 Finnhub 等）。
-* Crypto：請勿使用本模組；請走 market_service / Bybit。
+* 台股 TW 日線：Yahoo 主用（Render 上 TWSE OpenAPI 常回 HTML）；僅 ENABLE_TWSE_OPENAPI=true 時才在 Yahoo 失敗後嘗試 TWSE 備援。
+* 台股報價：見 market_service（MIS 優先 + 日線補足）。
+* 美股 US：Yahoo（us_stock_provider）。
+* Crypto：勿使用本模組。
 
 錯誤訊息經中性化處理，避免出現可能被誤解為下市的用語。
 """
@@ -16,15 +17,17 @@ from typing import Any, Dict, Tuple
 
 import pandas as pd
 
-_log = logging.getLogger(__name__)
-
-from app.services.twse_official_service import fetch_tw_daily_history_official
+from app.services.twse_official_service import (
+    fetch_tw_daily_history_official,
+    is_twse_openapi_enabled,
+)
 from app.services.us_stock_provider import fetch_us_history_yahoo_bounded
+
+_log = logging.getLogger(__name__)
 
 _CACHE: Dict[str, Tuple[float, Dict[str, Any]]] = {}
 CACHE_TTL_SECONDS = 60
 
-# 給前端／日誌的中性說明（勿暗示下市）
 NEUTRAL_DATA_ERROR = (
     "資料來源暫時查無資料，可能為 symbol mapping、官方資料延遲或第三方資料源異常"
 )
@@ -38,7 +41,6 @@ def _sanitize_public_error(err: str | None) -> str:
         return NEUTRAL_DATA_ERROR
     if "no data" in s and "yahoo" in s:
         return NEUTRAL_DATA_ERROR
-    # 仍回傳簡短技術代碼時，改中性包裝
     if err in (
         "empty_history",
         "yfinance_timeout",
@@ -57,7 +59,6 @@ def _is_tw_symbol(sym: str) -> bool:
 
 
 def normalize_tw_yf_symbol(symbol: str) -> str:
-    """台股快取鍵：一律 2330.TW。"""
     s = str(symbol).strip().upper().replace(".TWO", ".TW")
     if s.endswith(".TW"):
         return s
@@ -77,50 +78,48 @@ def _normalize_hist_columns(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def fetch_stock_data(yf_symbol: str) -> Dict[str, Any]:
-    """
-    單次取得股票 history（約 3 個月日線），失敗時 ok=False。
-    台股優先官方；美股使用 Yahoo（可替換層在 us_stock_provider）。
-    """
     key = str(yf_symbol).strip().upper()
-
     if _is_tw_symbol(key):
         return _fetch_tw_stock_data(key)
-
     return _fetch_us_stock_data(key)
 
 
 def _fetch_tw_stock_data(raw_key: str) -> Dict[str, Any]:
+    """
+    台股日線策略（務實）：
+    1) Yahoo 主用（chart/history）
+    2) 僅當 Yahoo 失敗且 ENABLE_TWSE_OPENAPI=true 時，才嘗試 TWSE 備援（避免 Render 每請求先撞 TWSE）
+    """
     canon = normalize_tw_yf_symbol(raw_key)
     code = canon.replace(".TW", "").replace(".TWO", "")
 
-    # 1) TWSE 官方日線（上市）
-    try:
-        hist_off = fetch_tw_daily_history_official(code, months_back=6)
-        if hist_off is not None and not hist_off.empty and len(hist_off) >= 2:
-            hist_off = _normalize_hist_columns(hist_off)
-            _log.info("market-data TW provider=TWSE_OFFICIAL symbol=%s rows=%s", canon, len(hist_off))
-            return {
-                "ok": True,
-                "symbol": canon,
-                "hist": hist_off,
-                "error": None,
-                "provider": "TWSE_OFFICIAL",
-            }
-    except Exception as e:
-        _log.warning("market-data TWSE_OFFICIAL exception symbol=%s err=%s", canon, str(e)[:200])
-
-    # 2) 備援：Yahoo Finance（僅能經 us_stock_provider）
     df, err = fetch_us_history_yahoo_bounded(canon)
     if df is not None and not df.empty:
         df = _normalize_hist_columns(df)
-        _log.info("market-data TW provider=YAHOO_FALLBACK symbol=%s rows=%s", canon, len(df))
+        _log.info("market-data TW provider=YAHOO_PRIMARY symbol=%s rows=%s", canon, len(df))
         return {
             "ok": True,
             "symbol": canon,
             "hist": df,
             "error": None,
-            "provider": "YAHOO_FALLBACK",
+            "provider": "YAHOO_PRIMARY",
         }
+
+    if is_twse_openapi_enabled():
+        try:
+            hist_off = fetch_tw_daily_history_official(code, months_back=6)
+            if hist_off is not None and not hist_off.empty and len(hist_off) >= 2:
+                hist_off = _normalize_hist_columns(hist_off)
+                _log.info("market-data TW provider=TWSE_OFFICIAL_FALLBACK symbol=%s rows=%s", canon, len(hist_off))
+                return {
+                    "ok": True,
+                    "symbol": canon,
+                    "hist": hist_off,
+                    "error": None,
+                    "provider": "TWSE_OFFICIAL_FALLBACK",
+                }
+        except Exception as e:
+            _log.warning("market-data TWSE fallback exception symbol=%s err=%s", canon, str(e)[:200])
 
     pub = _sanitize_public_error(err)
     _log.warning("market-data TW failed symbol=%s reason=%s", canon, err)
@@ -134,7 +133,6 @@ def _fetch_tw_stock_data(raw_key: str) -> Dict[str, Any]:
 
 
 def _fetch_us_stock_data(yf_symbol: str) -> Dict[str, Any]:
-    """美股：目前僅 Yahoo 實作（見 us_stock_provider，可替換主源）。"""
     key = str(yf_symbol).strip().upper()
     df, err = fetch_us_history_yahoo_bounded(key)
     if df is not None and not df.empty:
@@ -159,15 +157,10 @@ def _fetch_us_stock_data(yf_symbol: str) -> Dict[str, Any]:
 
 
 def get_stock_data(yf_symbol: str) -> Dict[str, Any]:
-    """別名：與規格「get_stock_data(symbol)」一致（無快取，單次抓取）。"""
     return fetch_stock_data(yf_symbol)
 
 
 def get_cached_stock_data(yf_symbol: str) -> Dict[str, Any]:
-    """
-    帶 60 秒記憶體快取的資料取得；quote / detail / chart / 技術分析共用。
-    台股快取鍵會正規化為 2330.TW。
-    """
     raw = str(yf_symbol).strip().upper()
     key = normalize_tw_yf_symbol(raw) if _is_tw_symbol(raw) else raw
 
@@ -186,12 +179,10 @@ def get_cached_stock_data(yf_symbol: str) -> Dict[str, Any]:
 
 
 def get_cached_data(yf_symbol: str) -> Dict[str, Any]:
-    """別名，與規格文件一致。"""
     return get_cached_stock_data(yf_symbol)
 
 
 def clear_stock_cache(symbol: str | None = None) -> None:
-    """測試或管理用：清除快取。"""
     global _CACHE
     if symbol is None:
         _CACHE = {}
