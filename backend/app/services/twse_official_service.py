@@ -1,7 +1,7 @@
 """
 TWSE OpenAPI：可選備援（Render 等環境常回 HTML，預設關閉）。
 
-環境變數 ENABLE_TWSE_OPENAPI=true 才會發送 HTTP；否則立即跳過，不產生失敗 log。
+環境變數 ENABLE_TWSE_OPENAPI=true 才會發送 HTTP；否則立即跳過（程序生命週期內僅記錄一次 TWSE skipped (disabled)）。
 硬性規則：Content-Type 須含 application/json，且 body 不得為 HTML，否則視為 provider_unavailable，不嘗試 json.loads。
 """
 
@@ -31,6 +31,8 @@ TWSE_STOCK_DAY_URL = "https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY"
 TWSE_STOCK_DAY_ALL_URL = "https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL"
 
 TWSE_PROVIDER = "TWSE_OPENAPI"
+
+_twse_disabled_logged = False
 
 
 def is_twse_openapi_enabled() -> bool:
@@ -108,6 +110,10 @@ def twse_safe_get_json(
     失敗碼：twse_disabled, provider_unavailable, http_NNN, empty_body, json_parse_failed, ssl_failed, request_error
     """
     if not is_twse_openapi_enabled():
+        global _twse_disabled_logged
+        if not _twse_disabled_logged:
+            logger.info("provider=%s TWSE skipped (disabled)", TWSE_PROVIDER)
+            _twse_disabled_logged = True
         return None, "twse_disabled"
 
     url_preview = _build_url_for_log(url, params)

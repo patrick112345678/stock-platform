@@ -1,12 +1,12 @@
 """
 股票資料統一入口：依市場分流資料源，並以記憶體快取 60 秒。
 
-* 台股 TW 日線：Yahoo 主用（Render 上 TWSE OpenAPI 常回 HTML）；僅 ENABLE_TWSE_OPENAPI=true 時才在 Yahoo 失敗後嘗試 TWSE 備援。
+* 台股 TW 日線：FinMind 主用 → Yahoo 備援 → 僅 ENABLE_TWSE_OPENAPI=true 時才嘗試 TWSE（預設關閉，避免 Render SSL/HTML/rate limit）。
 * 台股報價：見 market_service（MIS 優先 + 日線補足）。
 * 美股 US：Yahoo（us_stock_provider）。
 * Crypto：勿使用本模組。
 
-錯誤訊息經中性化處理，避免出現可能被誤解為下市的用語。
+錯誤訊息統一為中性「資料來源暫時不可用」，不暴露下市相關字樣。
 """
 
 from __future__ import annotations
@@ -17,6 +17,7 @@ from typing import Any, Dict, Tuple
 
 import pandas as pd
 
+from app.services.finmind_provider import fetch_tw_daily_history_finmind
 from app.services.twse_official_service import (
     fetch_tw_daily_history_official,
     is_twse_openapi_enabled,
@@ -28,27 +29,12 @@ _log = logging.getLogger(__name__)
 _CACHE: Dict[str, Tuple[float, Dict[str, Any]]] = {}
 CACHE_TTL_SECONDS = 60
 
-NEUTRAL_DATA_ERROR = (
-    "資料來源暫時查無資料，可能為 symbol mapping、官方資料延遲或第三方資料源異常"
-)
+NEUTRAL_DATA_ERROR = "資料來源暫時不可用"
 
 
-def _sanitize_public_error(err: str | None) -> str:
-    if not err:
-        return NEUTRAL_DATA_ERROR
-    s = str(err).lower()
-    if "delist" in s or "possibly delisted" in s or "delisted" in s:
-        return NEUTRAL_DATA_ERROR
-    if "no data" in s and "yahoo" in s:
-        return NEUTRAL_DATA_ERROR
-    if err in (
-        "empty_history",
-        "yfinance_timeout",
-        "yfinance_session_error",
-        "yahoo_quote_unavailable",
-    ):
-        return NEUTRAL_DATA_ERROR
-    return str(err)[:500]
+def _sanitize_public_error(_err: str | None) -> str:
+    """對外一律中性訊息，不暴露內部短碼或 Yahoo／yfinance 原文。"""
+    return NEUTRAL_DATA_ERROR
 
 
 def _is_tw_symbol(sym: str) -> bool:
@@ -86,21 +72,36 @@ def fetch_stock_data(yf_symbol: str) -> Dict[str, Any]:
 
 def _fetch_tw_stock_data(raw_key: str) -> Dict[str, Any]:
     """
-    台股日線策略（務實）：
-    1) Yahoo 主用（chart/history）
-    2) 僅當 Yahoo 失敗且 ENABLE_TWSE_OPENAPI=true 時，才嘗試 TWSE 備援（避免 Render 每請求先撞 TWSE）
+    台股日線：FinMind → Yahoo →（可選）TWSE OpenAPI。
     """
     canon = normalize_tw_yf_symbol(raw_key)
     code = canon.replace(".TW", "").replace(".TWO", "")
 
-    df, err = fetch_us_history_yahoo_bounded(canon)
-    if df is not None and not df.empty:
-        df = _normalize_hist_columns(df)
-        _log.info("market-data TW provider=YAHOO_PRIMARY symbol=%s rows=%s", canon, len(df))
+    df_fm, err_fm = fetch_tw_daily_history_finmind(code)
+    if df_fm is not None and not df_fm.empty and len(df_fm) >= 2:
+        df_fm = _normalize_hist_columns(df_fm)
+        _log.info("TW provider=FINMIND symbol=%s rows=%s", canon, len(df_fm))
         return {
             "ok": True,
             "symbol": canon,
-            "hist": df,
+            "hist": df_fm,
+            "error": None,
+            "provider": "FINMIND",
+        }
+
+    df_y, err_y = fetch_us_history_yahoo_bounded(canon)
+    if df_y is not None and not df_y.empty:
+        df_y = _normalize_hist_columns(df_y)
+        _log.info(
+            "TW provider=YAHOO fallback=YAHOO symbol=%s rows=%s finmind_err=%s",
+            canon,
+            len(df_y),
+            err_fm or "none",
+        )
+        return {
+            "ok": True,
+            "symbol": canon,
+            "hist": df_y,
             "error": None,
             "provider": "YAHOO_PRIMARY",
         }
@@ -110,7 +111,11 @@ def _fetch_tw_stock_data(raw_key: str) -> Dict[str, Any]:
             hist_off = fetch_tw_daily_history_official(code, months_back=6)
             if hist_off is not None and not hist_off.empty and len(hist_off) >= 2:
                 hist_off = _normalize_hist_columns(hist_off)
-                _log.info("market-data TW provider=TWSE_OFFICIAL_FALLBACK symbol=%s rows=%s", canon, len(hist_off))
+                _log.info(
+                    "TW provider=TWSE_OFFICIAL_FALLBACK symbol=%s rows=%s",
+                    canon,
+                    len(hist_off),
+                )
                 return {
                     "ok": True,
                     "symbol": canon,
@@ -121,8 +126,14 @@ def _fetch_tw_stock_data(raw_key: str) -> Dict[str, Any]:
         except Exception as e:
             _log.warning("market-data TWSE fallback exception symbol=%s err=%s", canon, str(e)[:200])
 
-    pub = _sanitize_public_error(err)
-    _log.warning("market-data TW failed symbol=%s reason=%s", canon, err)
+    internal = err_y or err_fm
+    pub = _sanitize_public_error(internal)
+    _log.warning(
+        "market-data TW failed symbol=%s finmind=%s yahoo=%s",
+        canon,
+        err_fm,
+        err_y,
+    )
     return {
         "ok": False,
         "symbol": canon,
