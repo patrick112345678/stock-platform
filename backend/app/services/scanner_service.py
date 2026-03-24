@@ -450,6 +450,8 @@ def get_bybit_kline(symbol: str, interval: str = "D", limit: int = 120) -> pd.Da
         "limit": limit,
     }
     r = requests.get(url, params=params, timeout=5, headers=REQUEST_HEADERS)
+    if r.status_code == 403:
+        print(f"[crypto] provider=BYBIT HTTP 403 kline symbol={symbol} interval={interval} -> fallback BINANCE")
     r.raise_for_status()
     data = r.json()
 
@@ -519,16 +521,16 @@ def get_binance_kline(symbol: str, interval: str = "D", limit: int = 120) -> pd.
 
 
 def get_crypto_kline_with_fallback(symbol: str, interval: str = "D", limit: int = 120) -> tuple[pd.DataFrame, str]:
-    """先 Bybit，失敗則 Binance。回傳 (DataFrame, 'BYBIT'|'BINANCE')"""
+    """先 Bybit，失敗則 Binance。不使用 Yahoo。回傳 (DataFrame, 'BYBIT'|'BINANCE')"""
     try:
         return get_bybit_kline(symbol, interval, limit), "BYBIT"
     except Exception as e:
-        print("WARN Bybit kline failed, trying Binance:", symbol, repr(e))
+        print("[crypto] provider=BYBIT kline failed, fallback=BINANCE", symbol, repr(e))
         try:
             return get_binance_kline(symbol, interval, limit), "BINANCE"
         except Exception as e2:
             raise ValueError(
-                f"Bybit 與 Binance 皆無法取得 K 線: {symbol}: {e2!r}"
+                f"加密 K 線暫時無法取得（Bybit 與 Binance 皆失敗）: {symbol}"
             ) from e2
 
 

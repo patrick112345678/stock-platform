@@ -1,5 +1,8 @@
 # app/services/market_service.py
-# 股票資料統一走 get_cached_stock_data（單一 yfinance history + 60s 快取），避免重複打 Yahoo。
+# 行情內部實作：
+# - 台股：TWSE OpenAPI 日線（優先）+ MIS 即時；歷史備援 Yahoo。
+# - 美股：Yahoo（us_stock_provider，可替換為 Finnhub 等）。
+# - 加密：Bybit → Binance，不使用 Yahoo。
 
 import math
 import os
@@ -10,7 +13,7 @@ from fastapi import HTTPException
 from typing import List, Dict, Any, Optional, Literal
 
 from app.schemas.market import MarketCandleItem, MarketChartResponse
-from app.services.stock_data_service import get_cached_stock_data, get_cached_data
+from app.services.stock_data_service import get_cached_stock_data, get_cached_data, NEUTRAL_DATA_ERROR
 from app.services.scanner_service import (
     get_crypto_kline_with_fallback,
     get_tw_universe,
@@ -156,14 +159,27 @@ def get_ticker(symbol: str):
         row = dict(items[0])
         row["_exchange"] = "BYBIT"
         return row
-    except Exception as e:
-        print("WARN Bybit ticker failed, trying Binance:", symbol, repr(e))
+    except requests.HTTPError as e:
+        code = e.response.status_code if e.response is not None else None
+        if code == 403:
+            print(f"[crypto] provider=BYBIT HTTP 403, fallback=BINANCE ticker symbol={symbol}")
+        else:
+            print(f"[crypto] provider=BYBIT HTTP error {code}, fallback=BINANCE ticker symbol={symbol}", repr(e))
         try:
             return _binance_ticker_row(symbol)
         except Exception as e2:
             raise HTTPException(
                 status_code=404,
-                detail=f"Bybit 與 Binance 皆查無報價: {symbol} ({e2!r})",
+                detail=f"加密貨幣報價暫時無法取得（Bybit 與 Binance 皆失敗），請稍後再試。",
+            ) from e2
+    except Exception as e:
+        print("[crypto] provider=BYBIT failed, fallback=BINANCE ticker", symbol, repr(e))
+        try:
+            return _binance_ticker_row(symbol)
+        except Exception as e2:
+            raise HTTPException(
+                status_code=404,
+                detail=f"加密貨幣報價暫時無法取得（Bybit 與 Binance 皆失敗），請稍後再試。",
             ) from e2
 
 
@@ -319,31 +335,37 @@ def get_quote_data(symbol: str, market: str = "stock"):
 def _get_quote_data_stock(raw_symbol: str, _market: str) -> Dict[str, Any]:
     stock_symbol = normalize_stock_symbol(raw_symbol)
     bundle = get_cached_data(stock_symbol)
+    prov = bundle.get("provider")
+    if bundle.get("ok"):
+        print(f"[quote] hist provider={prov} symbol={stock_symbol}")
+    else:
+        print(f"[quote] hist failed symbol={stock_symbol} err={bundle.get('error')!r}")
+
     hist = bundle.get("hist") if bundle.get("ok") else None
 
     current_price = None
     previous_close = None
-    if hist is not None and not hist.empty and "Close" in hist.columns:
-        cs = hist["Close"].dropna()
-        if len(cs) >= 1:
-            current_price = safe_float(cs.iloc[-1])
-        if len(cs) >= 2:
-            previous_close = safe_float(cs.iloc[-2])
-        elif len(cs) == 1:
-            previous_close = current_price
-
     tw_name = None
+
+    # 台股：優先 MIS（證交所官方即時），再以日線收盤補足
     if stock_symbol.endswith(".TW"):
         try:
             snap = fetch_tw_mis_snapshot(stock_symbol)
             if snap:
-                if current_price is None:
-                    current_price = safe_float(snap.get("price"))
-                if previous_close is None:
-                    previous_close = safe_float(snap.get("previous_close"))
+                current_price = safe_float(snap.get("price"))
+                previous_close = safe_float(snap.get("previous_close"))
                 tw_name = snap.get("name")
         except Exception:
             pass
+
+    if hist is not None and not hist.empty and "Close" in hist.columns:
+        cs = hist["Close"].dropna()
+        if len(cs) >= 1 and current_price is None:
+            current_price = safe_float(cs.iloc[-1])
+        if len(cs) >= 2 and previous_close is None:
+            previous_close = safe_float(cs.iloc[-2])
+        elif len(cs) == 1 and previous_close is None:
+            previous_close = current_price
 
     if current_price is None:
         return {
@@ -459,6 +481,11 @@ def get_detail_data(symbol: str, market: str = "stock"):
         if hi is not None and lo is not None:
             quality = "部分"
 
+        errors: List[str] = []
+        if not bundle.get("ok"):
+            err = bundle.get("error")
+            if err:
+                errors.append(str(err))
         return {
             "symbol": stock_symbol,
             "raw_symbol": raw_symbol,
@@ -487,7 +514,7 @@ def get_detail_data(symbol: str, market: str = "stock"):
             "fetch_interval": "1d",
             "period": "3mo",
             "data_quality": quality,
-            "errors": [],
+            "errors": errors,
         }
     except Exception as e:
         print("WARN get_detail_data:", repr(e))
@@ -521,7 +548,7 @@ def get_detail_data(symbol: str, market: str = "stock"):
             "fetch_interval": "1d",
             "period": "3mo",
             "data_quality": "無資料",
-            "errors": [],
+            "errors": [NEUTRAL_DATA_ERROR],
         }
 
 
