@@ -688,6 +688,27 @@ def get_tw_symbol_to_name() -> Dict[str, str]:
     return {x["symbol"]: x["name"] for x in formatted}
 
 
+def get_tw_symbol_to_chinese_only() -> Dict[str, str]:
+    """
+    自選股側欄用：僅中文簡稱（無「（2330）」），避免前端再拼代號時變成 台積電（2330）(2330)。
+    """
+    from app.services.fundamental_provider import load_finmind_tw_stock_info_map
+
+    raw = _get_tw_search_raw_items()
+    finm = load_finmind_tw_stock_info_map()
+    out: Dict[str, str] = {}
+    for x in raw:
+        sym = str(x.get("symbol", "")).strip()
+        if not sym:
+            continue
+        zh = finm.get(sym) or x.get("name")
+        if not zh or str(zh).strip() == sym:
+            out[sym] = sym
+        else:
+            out[sym] = str(zh).strip()
+    return out
+
+
 def enrich_tw_names(items: List[Dict[str, Any]], market: str = "TW") -> List[Dict[str, Any]]:
     """為台股項目加入顯示名稱：台積電（2330）（有對照表時覆寫）"""
     if market != "TW":

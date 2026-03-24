@@ -11,13 +11,28 @@ from app.schemas.watchlist import (
     WatchlistOverviewResponse,
 )
 from app.core.security import get_current_user
-from app.services.scanner_service import get_tw_symbol_to_name
+from app.services.scanner_service import get_tw_symbol_to_chinese_only
+from app.services.fundamental_provider import format_tw_display_name
 from app.services.market_service import get_quote_data
 
 import math
 import time
 
 router = APIRouter(prefix="/watchlist", tags=["watchlist"])
+
+
+def _tw_list_display_name(symbol: str) -> str | None:
+    """
+    台股自選股顯示名稱：台積電（2330）。
+    使用中文簡稱 + 代號單次組字，避免與 get_tw_symbol_to_name 重複括號邏輯。
+    前端請只顯示此欄位，勿再串 symbol。
+    """
+    code = symbol.replace(".TW", "").replace(".TWO", "").strip()
+    cn_map = get_tw_symbol_to_chinese_only()
+    zh = cn_map.get(code)
+    if not zh or zh == code:
+        return code
+    return format_tw_display_name(zh, code)
 
 
 def get_db():
@@ -92,8 +107,7 @@ def add_watchlist(
     db.add(item)
     db.commit()
     db.refresh(item)
-    tw_names = get_tw_symbol_to_name() if data.market == "TW" else {}
-    name = tw_names.get(symbol.replace(".TW", "")) if data.market == "TW" else None
+    name = _tw_list_display_name(symbol) if data.market == "TW" else None
     return WatchlistResponse(
         id=item.id,
         user_id=item.user_id,
@@ -119,15 +133,13 @@ def get_watchlist(
         query = query.filter(Watchlist.market == market)
 
     items = query.all()
-    tw_names = get_tw_symbol_to_name() if any(w.market == "TW" for w in items) else {}
-
     return [
         WatchlistResponse(
             id=w.id,
             user_id=w.user_id,
             symbol=w.symbol,
             market=w.market,
-            name=tw_names.get(w.symbol.replace(".TW", "")) if w.market == "TW" else None,
+            name=_tw_list_display_name(w.symbol) if w.market == "TW" else None,
         )
         for w in items
     ]
@@ -160,14 +172,13 @@ def get_watchlist_overview(
         Watchlist.user_id == current_user.id
     ).all()
 
-    tw_names = get_tw_symbol_to_name() if any(w.market == "TW" for w in items) else {}
     result = []
     for idx, item in enumerate(items):
         # 行情層已有 60s 快取；保留少量間隔降低外部 API 瞬間壓力
         if idx > 0:
             time.sleep(0.08)
         quote = _build_quote_data(item.symbol, item.market or "US")
-        name = tw_names.get(item.symbol.replace(".TW", "")) if item.market == "TW" else None
+        name = _tw_list_display_name(item.symbol) if item.market == "TW" else None
         result.append(
             WatchlistOverviewItem(
                 id=item.id,

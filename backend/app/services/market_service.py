@@ -1,6 +1,6 @@
 # app/services/market_service.py
 # 行情內部實作：
-# - 台股：日線 FinMind→Yahoo→（可選）TWSE；即時 MIS；基本面 FinMind PER/PBR/EPS；股名 FinMind TaiwanStockInfo。
+# - 台股：日線 FinMind→Yahoo→（可選）TWSE；即時 MIS；基本面多 dataset（見 fundamental_provider）。
 # - 美股：Yahoo（us_stock_provider，可替換為 Finnhub 等）。
 # - 加密：Bybit → Binance，不使用 Yahoo。
 
@@ -15,7 +15,7 @@ from typing import List, Dict, Any, Optional, Literal
 from app.schemas.market import MarketCandleItem, MarketChartResponse
 from app.services.stock_data_service import get_cached_stock_data, get_cached_data, NEUTRAL_DATA_ERROR
 from app.services.fundamental_provider import (
-    fetch_tw_fundamentals_finmind,
+    fetch_tw_fundamental_bundle,
     resolve_tw_display_name,
 )
 from app.services.technical_service import valuation_label
@@ -501,33 +501,56 @@ def get_detail_data(symbol: str, market: str = "stock"):
 
         code = stock_symbol.replace(".TW", "").replace(".TWO", "").strip()
         is_tw = stock_symbol.endswith((".TW", ".TWO")) or raw_symbol.isdigit()
-        fund = fetch_tw_fundamentals_finmind(code) if is_tw and code.isdigit() else {"pe": None, "pb": None, "eps": None}
-        pe = fund.get("pe")
-        pb = fund.get("pb")
-        eps = fund.get("eps")
         qn = quote.get("name") or stock_symbol
+        fund = None
+        fundamental: Optional[dict[str, Any]] = None
         if is_tw and code.isdigit():
+            fund = fetch_tw_fundamental_bundle(code)
             tw_fb = qn if qn and qn != stock_symbol else None
-            detail_name = resolve_tw_display_name(code, fallback_zh=tw_fb)
-            valuation_val: Optional[str] = valuation_label(
+            if fund.get("stock_name_zh"):
+                detail_name = str(fund.get("display_name") or "").strip() or resolve_tw_display_name(
+                    code, fallback_zh=tw_fb
+                )
+            else:
+                detail_name = resolve_tw_display_name(code, fallback_zh=tw_fb)
+            pe = fund.get("pe")
+            pb = fund.get("pb")
+            eps = fund.get("eps")
+            valuation_val = valuation_label(
                 pe=pe,
                 pb=pb,
                 eps=eps,
                 price=quote.get("price"),
                 lang="zh",
             )
+            ind = fund.get("industry")
+            fundamental = {
+                "pe": fund.get("pe"),
+                "pb": fund.get("pb"),
+                "eps": fund.get("eps"),
+                "roe": fund.get("roe"),
+                "gross_margin": fund.get("gross_margin"),
+                "revenue_growth_yoy": fund.get("revenue_growth_yoy"),
+                "debt_ratio": fund.get("debt_ratio"),
+                "valuation": valuation_val,
+                "industry": ind,
+                "stock_name_zh": fund.get("stock_name_zh"),
+                "display_name": detail_name,
+            }
         else:
             detail_name = qn
             valuation_val = None
+            pe = pb = eps = None
+            ind = None
 
         return {
             "symbol": stock_symbol,
             "raw_symbol": raw_symbol,
             "name": detail_name,
             "market": market_label,
-            "industry": "N/A",
-            "sector": "N/A",
-            "display_industry": "N/A",
+            "industry": ind if is_tw else None,
+            "sector": ind if is_tw else None,
+            "display_industry": ind if is_tw else None,
             "price": quote.get("price"),
             "change": quote.get("change"),
             "change_percent": quote.get("change_percent"),
@@ -537,11 +560,12 @@ def get_detail_data(symbol: str, market: str = "stock"):
             "pe": pe,
             "pb": pb,
             "eps": eps,
-            "roe": None,
-            "gross": None,
-            "revenue": None,
-            "debt": None,
+            "roe": fund.get("roe") if fund else None,
+            "gross": fund.get("gross_margin") if fund else None,
+            "revenue": fund.get("revenue_growth_yoy") if fund else None,
+            "debt": fund.get("debt_ratio") if fund else None,
             "valuation": valuation_val,
+            "fundamental": fundamental,
             "currency": quote.get("currency"),
             "exchange": quote.get("exchange"),
             "interval": "1d",
@@ -576,6 +600,7 @@ def get_detail_data(symbol: str, market: str = "stock"):
             "revenue": None,
             "debt": None,
             "valuation": None,
+            "fundamental": None,
             "currency": None,
             "exchange": None,
             "interval": "1d",
@@ -775,6 +800,12 @@ def get_market_data(symbol: str, market: str = "US", interval: str = "1d", perio
                 "pe": None,
                 "pb": None,
                 "eps": None,
+                "roe": None,
+                "gross_margin": None,
+                "revenue_growth_yoy": None,
+                "debt_ratio": None,
+                "industry": None,
+                "fundamental": None,
                 "hist": pd.DataFrame(),
             }
 
@@ -805,6 +836,12 @@ def get_market_data(symbol: str, market: str = "US", interval: str = "1d", perio
                 "pe": None,
                 "pb": None,
                 "eps": None,
+                "roe": None,
+                "gross_margin": None,
+                "revenue_growth_yoy": None,
+                "debt_ratio": None,
+                "industry": None,
+                "fundamental": None,
                 "hist": pd.DataFrame(),
             }
 
@@ -816,14 +853,25 @@ def get_market_data(symbol: str, market: str = "US", interval: str = "1d", perio
         pe_v: Optional[float] = None
         pb_v: Optional[float] = None
         eps_v: Optional[float] = None
+        roe_v: Optional[float] = None
+        gm_v: Optional[float] = None
+        rev_yoy_v: Optional[float] = None
+        debt_v: Optional[float] = None
+        ind_v: Optional[str] = None
         display_name: str = raw_symbol
+        fundamental_mkt: Optional[dict[str, Any]] = None
 
         if market_upper == "TW":
             code = yf_symbol.replace(".TW", "").replace(".TWO", "").strip()
-            fund = fetch_tw_fundamentals_finmind(code)
-            pe_v = fund.get("pe")
-            pb_v = fund.get("pb")
-            eps_v = fund.get("eps")
+            b = fetch_tw_fundamental_bundle(code)
+            pe_v = b.get("pe")
+            pb_v = b.get("pb")
+            eps_v = b.get("eps")
+            roe_v = b.get("roe")
+            gm_v = b.get("gross_margin")
+            rev_yoy_v = b.get("revenue_growth_yoy")
+            debt_v = b.get("debt_ratio")
+            ind_v = b.get("industry")
             snap_name = None
             try:
                 snap = fetch_tw_mis_snapshot(yf_symbol)
@@ -831,7 +879,32 @@ def get_market_data(symbol: str, market: str = "US", interval: str = "1d", perio
                     snap_name = snap.get("name")
             except Exception:
                 pass
-            display_name = resolve_tw_display_name(code, fallback_zh=snap_name)
+            if b.get("stock_name_zh"):
+                display_name = str(b.get("display_name") or "").strip() or resolve_tw_display_name(
+                    code, fallback_zh=snap_name
+                )
+            else:
+                display_name = resolve_tw_display_name(code, fallback_zh=snap_name)
+            val_l = valuation_label(
+                pe=pe_v,
+                pb=pb_v,
+                eps=eps_v,
+                price=latest_close,
+                lang="zh",
+            )
+            fundamental_mkt = {
+                "pe": pe_v,
+                "pb": pb_v,
+                "eps": eps_v,
+                "roe": roe_v,
+                "gross_margin": gm_v,
+                "revenue_growth_yoy": rev_yoy_v,
+                "debt_ratio": debt_v,
+                "valuation": val_l,
+                "industry": ind_v,
+                "stock_name_zh": b.get("stock_name_zh"),
+                "display_name": display_name,
+            }
 
         return {
             "raw_symbol": raw_symbol,
@@ -843,6 +916,12 @@ def get_market_data(symbol: str, market: str = "US", interval: str = "1d", perio
             "pe": pe_v,
             "pb": pb_v,
             "eps": eps_v,
+            "roe": roe_v,
+            "gross_margin": gm_v,
+            "revenue_growth_yoy": rev_yoy_v,
+            "debt_ratio": debt_v,
+            "industry": ind_v,
+            "fundamental": fundamental_mkt,
             "hist": hist,
         }
     except Exception as e:
@@ -857,6 +936,12 @@ def get_market_data(symbol: str, market: str = "US", interval: str = "1d", perio
             "pe": None,
             "pb": None,
             "eps": None,
+            "roe": None,
+            "gross_margin": None,
+            "revenue_growth_yoy": None,
+            "debt_ratio": None,
+            "industry": None,
+            "fundamental": None,
             "hist": pd.DataFrame(),
         }
 
