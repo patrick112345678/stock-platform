@@ -205,6 +205,30 @@ def _ttm_income_after_tax(fin_by_date: dict[str, dict[str, float]]) -> Optional[
     return total
 
 
+def _latest_quarter_eps(fin_by_date: dict[str, dict[str, float]]) -> Optional[float]:
+    """綜合損益表最新一季 EPS（FinMind v4 已無 TaiwanStockEPS dataset）。"""
+    if not fin_by_date:
+        return None
+    latest = max(fin_by_date.keys())
+    m = fin_by_date[latest]
+    v = _pick_metric(
+        m,
+        [
+            "BasicEarningsPerShare",
+            "EarningsPerShare",
+            "EPS",
+            "EpsPerShare",
+            "EarningPerShare",
+        ],
+    )
+    if v is not None:
+        return v
+    v = _find_metric_substr(m, ("basic", "earning", "share"))
+    if v is not None:
+        return v
+    return _find_metric_substr(m, ("eps",))
+
+
 def _latest_quarter_gross_margin(fin_by_date: dict[str, dict[str, float]]) -> Optional[float]:
     if not fin_by_date:
         return None
@@ -326,22 +350,13 @@ def fetch_tw_fundamental_bundle(stock_code: str) -> dict[str, Any]:
 
     out = dict(empty)
 
-    # --- 市價指標：PER / PBR / EPS ---
+    # --- 市價指標：PER + PBR（同一 dataset TaiwanStockPER；v4 已廢除 TaiwanStockPB）---
     per_rows = _load_dataset_rows("TaiwanStockPER", code, start_market, end)
-    pb_rows = _load_dataset_rows("TaiwanStockPB", code, start_market, end)
-    eps_rows = _load_dataset_rows("TaiwanStockEPS", code, start_market, end)
     if per_rows:
         r = _latest_row(per_rows)
         if r:
             out["pe"] = _extract_per(r)
-    if pb_rows:
-        r = _latest_row(pb_rows)
-        if r:
             out["pb"] = _extract_pbr(r)
-    if eps_rows:
-        r = _latest_row(eps_rows)
-        if r:
-            out["eps"] = _extract_eps(r)
 
     # --- TaiwanStockInfo：股名、產業 ---
     info_row = _fetch_single_tw_stock_info_row(code)
@@ -361,10 +376,11 @@ def fetch_tw_fundamental_bundle(stock_code: str) -> dict[str, Any]:
         else:
             out["display_name"] = code
 
-    # --- 綜合損益：毛利率（單季）---
+    # --- 綜合損益：毛利率（單季）、EPS（v4 已廢除 TaiwanStockEPS，改由財報長表）---
     fin_rows = _load_dataset_rows("TaiwanStockFinancialStatements", code, start_fin, end)
     fin_by = _pivot_long_by_date(fin_rows)
     out["gross_margin"] = _latest_quarter_gross_margin(fin_by)
+    out["eps"] = _latest_quarter_eps(fin_by)
     ttm_ni = _ttm_income_after_tax(fin_by)
 
     # --- 資產負債表：負債比、ROE 分母 ---
