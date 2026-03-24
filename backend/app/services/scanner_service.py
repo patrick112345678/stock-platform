@@ -601,7 +601,7 @@ def get_tw_universe(pool="TOP30"):
     return symbols[:SCANNER_UNIVERSE_MAX]
 
 
-TW_SEARCH_CACHE: List[Dict[str, str]] | None = None
+TW_SEARCH_RAW_CACHE: List[Dict[str, str]] | None = None
 
 
 def _load_tw_stock_master_fallback() -> List[Dict[str, str]]:
@@ -631,14 +631,14 @@ def _load_tw_stock_master_fallback() -> List[Dict[str, str]]:
         ]
 
 
-def get_tw_search_items() -> List[Dict[str, str]]:
-    """取得台股搜尋用清單（含代號與公司名稱），供 /market/search 使用。優先 TWSE API，失敗則載入 tw_stock_master.json"""
-    global TW_SEARCH_CACHE
-    if TW_SEARCH_CACHE is not None:
-        return TW_SEARCH_CACHE
+def _get_tw_search_raw_items() -> List[Dict[str, str]]:
+    """台股搜尋原始清單（代號 + 中文名，不含括號格式）；快取於記憶體。"""
+    global TW_SEARCH_RAW_CACHE
+    if TW_SEARCH_RAW_CACHE is not None:
+        return TW_SEARCH_RAW_CACHE
     try:
         data = _fetch_twse_stock_day_all()
-        items = []
+        items: List[Dict[str, str]] = []
         for item in data:
             code = item.get("Code", "")
             name = item.get("Name", "")
@@ -646,29 +646,55 @@ def get_tw_search_items() -> List[Dict[str, str]]:
                 display_symbol = str(code).strip()
                 items.append({"symbol": display_symbol, "name": (name or display_symbol).strip()})
         if not items:
-            TW_SEARCH_CACHE = _load_tw_stock_master_fallback()
-            return TW_SEARCH_CACHE
-        TW_SEARCH_CACHE = items
-        return items
+            TW_SEARCH_RAW_CACHE = _load_tw_stock_master_fallback()
+            return TW_SEARCH_RAW_CACHE
+        TW_SEARCH_RAW_CACHE = items
+        return TW_SEARCH_RAW_CACHE
     except Exception as e:
         print("❌ get_tw_search_items TWSE API failed:", repr(e), "-> loading from tw_stock_master.json")
-        TW_SEARCH_CACHE = _load_tw_stock_master_fallback()
-        return TW_SEARCH_CACHE
+        TW_SEARCH_RAW_CACHE = _load_tw_stock_master_fallback()
+        return TW_SEARCH_RAW_CACHE
+
+
+def format_tw_search_items_with_display(raw: List[Dict[str, str]]) -> List[Dict[str, str]]:
+    """FinMind 股名優先，顯示為 台積電（2330）。"""
+    from app.services.fundamental_provider import format_tw_display_name, load_finmind_tw_stock_info_map
+
+    finm = load_finmind_tw_stock_info_map()
+    out: List[Dict[str, str]] = []
+    for x in raw:
+        sym = str(x.get("symbol", "")).strip()
+        if not sym:
+            continue
+        zh = finm.get(sym) or x.get("name")
+        if not zh or str(zh).strip() == sym:
+            name = sym
+        else:
+            name = format_tw_display_name(str(zh).strip(), sym)
+        out.append({"symbol": sym, "name": name})
+    return out
+
+
+def get_tw_search_items() -> List[Dict[str, str]]:
+    """取得台股搜尋用清單（含代號與顯示名稱 台積電（2330）），供 /market/search 使用。優先 TWSE API，失敗則載入 tw_stock_master.json"""
+    raw = _get_tw_search_raw_items()
+    return format_tw_search_items_with_display(raw)
 
 
 def get_tw_symbol_to_name() -> Dict[str, str]:
-    """取得台股代號 -> 中文名稱對照表"""
-    items = get_tw_search_items()
-    return {x["symbol"]: x["name"] for x in items}
+    """取得台股代號 -> 顯示名稱（優先 FinMind TaiwanStockInfo），格式：台積電（2330）；失敗則為代號。"""
+    raw = _get_tw_search_raw_items()
+    formatted = format_tw_search_items_with_display(raw)
+    return {x["symbol"]: x["name"] for x in formatted}
 
 
 def enrich_tw_names(items: List[Dict[str, Any]], market: str = "TW") -> List[Dict[str, Any]]:
-    """為台股項目加入中文名稱（有對照表時覆寫，確保顯示中文股名）"""
+    """為台股項目加入顯示名稱：台積電（2330）（有對照表時覆寫）"""
     if market != "TW":
         return items
     name_map = get_tw_symbol_to_name()
     for item in items:
-        sym = str(item.get("symbol", "")).replace(".TW", "").strip()
+        sym = str(item.get("symbol", "")).replace(".TW", "").replace(".TWO", "").strip()
         if sym and name_map.get(sym):
             item["name"] = name_map.get(sym)
         elif sym and not item.get("name"):
@@ -736,6 +762,7 @@ def build_opportunity_from_df(
     market: str,
     exchange: str,
     display_symbol: str | None = None,
+    display_name: str | None = None,
     min_bars: int = 60,
 ) -> Dict[str, Any]:
     if df is None or len(df) < 2:
@@ -782,9 +809,12 @@ def build_opportunity_from_df(
     elif support and price and support > 0 and (price - support) / support < 0.02:
         pattern = "接近支撐"
 
+    sym_out = display_symbol if display_symbol is not None else symbol
+    name_out = display_name if display_name is not None else (display_symbol or symbol)
+
     return {
-        "symbol": display_symbol or symbol,
-        "name": (display_symbol or symbol),
+        "symbol": sym_out,
+        "name": name_out,
         "market": market,
         "exchange": exchange,
         "price": price or 0,
@@ -822,12 +852,16 @@ def process_us_symbol(symbol: str):
 def process_tw_symbol(yf_symbol: str):
     try:
         df = get_stock_hist(yf_symbol)
+        code = yf_symbol.replace(".TW", "").replace(".TWO", "").strip()
+        tw_map = get_tw_symbol_to_name()
+        disp_name = tw_map.get(code)
         return build_opportunity_from_df(
             df=df,
             symbol=yf_symbol,
             market="TW",
             exchange="TW",
-            display_symbol=yf_symbol.replace(".TW", ""),
+            display_symbol=code,
+            display_name=disp_name,
             min_bars=60,
         )
     except Exception as e:

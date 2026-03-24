@@ -81,26 +81,54 @@ def trend_label(score: int, lang: str = "zh") -> str:
     return "偏空"
 
 
-def valuation_label(pe: Any, pb: Any, lang: str = "zh") -> str:
+def valuation_label(
+    pe: Any,
+    pb: Any,
+    lang: str = "zh",
+    eps: Any = None,
+    price: Any = None,
+) -> str:
+    """
+    台股估值評級（優先本益比）：
+    PE < 15 → 偏低估；15～25 → 合理；> 25 → 偏高估。
+    若無 PE，可用 股價/EPS 推算；再無則參考 PB。
+    僅在 PE／PB／EPS 皆無法形成有效指標時顯示「資料不足」。
+    """
     pe_f = _safe_float(pe, digits=6)
     pb_f = _safe_float(pb, digits=6)
+    eps_f = _safe_float(eps, digits=8)
+    price_f = _safe_float(price, digits=8)
 
-    if pe_f is None and pb_f is None:
-        return "資料不足" if lang != "en" else "Insufficient Data"
+    if pe_f is not None and pe_f <= 0:
+        pe_f = None
+    if pe_f is None and price_f is not None and eps_f is not None and eps_f > 0:
+        pe_f = price_f / eps_f
 
-    if pe_f is not None:
+    if pe_f is not None and pe_f > 0:
+        if lang != "en":
+            if pe_f < 15:
+                return "偏低估"
+            if pe_f <= 25:
+                return "合理"
+            return "偏高估"
         if pe_f < 15:
-            return "偏低" if lang != "en" else "Undervalued"
+            return "Undervalued"
         if pe_f <= 25:
-            return "合理" if lang != "en" else "Fair"
-        return "偏高" if lang != "en" else "Overvalued"
+            return "Fair"
+        return "Overvalued"
 
-    if pb_f is not None:
+    if pb_f is not None and pb_f > 0:
+        if lang != "en":
+            if pb_f < 1.5:
+                return "偏低估"
+            if pb_f <= 3:
+                return "合理"
+            return "偏高估"
         if pb_f < 1.5:
-            return "偏低" if lang != "en" else "Undervalued"
+            return "Undervalued"
         if pb_f <= 3:
-            return "合理" if lang != "en" else "Fair"
-        return "偏高" if lang != "en" else "Overvalued"
+            return "Fair"
+        return "Overvalued"
 
     return "資料不足" if lang != "en" else "Insufficient Data"
 
@@ -389,13 +417,15 @@ def build_quick_summary(data: dict, lang: str = "zh") -> dict:
 
     pe = data.get("pe")
     pb = data.get("pb")
+    eps = data.get("eps")
+    price_for_pe = close
 
     score = trend_score(hist)
     bull_strength = round((score / 5) * 100, 1) if score is not None else 0.0
     bear_strength = round(100 - bull_strength, 1)
     trend = trend_label(score, lang=lang)
 
-    valuation = valuation_label(pe=pe, pb=pb, lang=lang)
+    valuation = valuation_label(pe=pe, pb=pb, lang=lang, eps=eps, price=price_for_pe)
     risk = risk_label(latest, support_f, resistance_f, lang=lang)
 
     patterns = detect_patterns(hist)

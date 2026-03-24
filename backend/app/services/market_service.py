@@ -1,6 +1,6 @@
 # app/services/market_service.py
 # 行情內部實作：
-# - 台股：TWSE OpenAPI 日線（優先）+ MIS 即時；歷史備援 Yahoo。
+# - 台股：日線 FinMind→Yahoo→（可選）TWSE；即時 MIS；基本面 FinMind PER/PBR/EPS；股名 FinMind TaiwanStockInfo。
 # - 美股：Yahoo（us_stock_provider，可替換為 Finnhub 等）。
 # - 加密：Bybit → Binance，不使用 Yahoo。
 
@@ -14,6 +14,11 @@ from typing import List, Dict, Any, Optional, Literal
 
 from app.schemas.market import MarketCandleItem, MarketChartResponse
 from app.services.stock_data_service import get_cached_stock_data, get_cached_data, NEUTRAL_DATA_ERROR
+from app.services.fundamental_provider import (
+    fetch_tw_fundamentals_finmind,
+    resolve_tw_display_name,
+)
+from app.services.technical_service import valuation_label
 from app.services.scanner_service import (
     get_crypto_kline_with_fallback,
     get_tw_universe,
@@ -346,9 +351,10 @@ def _get_quote_data_stock(raw_symbol: str, _market: str) -> Dict[str, Any]:
     current_price = None
     previous_close = None
     tw_name = None
+    is_tw = stock_symbol.endswith((".TW", ".TWO"))
 
     # 台股：優先 MIS（證交所官方即時），再以日線收盤補足
-    if stock_symbol.endswith(".TW"):
+    if is_tw:
         try:
             snap = fetch_tw_mis_snapshot(stock_symbol)
             if snap:
@@ -367,11 +373,17 @@ def _get_quote_data_stock(raw_symbol: str, _market: str) -> Dict[str, Any]:
         elif len(cs) == 1 and previous_close is None:
             previous_close = current_price
 
+    code = stock_symbol.replace(".TW", "").replace(".TWO", "").strip()
+    if is_tw and code.isdigit():
+        display_name = resolve_tw_display_name(code, fallback_zh=tw_name)
+    else:
+        display_name = tw_name or stock_symbol
+
     if current_price is None:
         return {
             "symbol": stock_symbol,
-            "name": tw_name or stock_symbol,
-            "currency": "TWD" if stock_symbol.endswith(".TW") else None,
+            "name": display_name,
+            "currency": "TWD" if is_tw else None,
             "exchange": None,
             "price": 0.0,
             "previous_close": previous_close,
@@ -387,8 +399,8 @@ def _get_quote_data_stock(raw_symbol: str, _market: str) -> Dict[str, Any]:
 
     return {
         "symbol": stock_symbol,
-        "name": tw_name or stock_symbol,
-        "currency": "TWD" if stock_symbol.endswith(".TW") else None,
+        "name": display_name,
+        "currency": "TWD" if is_tw else None,
         "exchange": None,
         "price": round(current_price, 4),
         "previous_close": round(previous_close, 4) if previous_close is not None else None,
@@ -486,10 +498,32 @@ def get_detail_data(symbol: str, market: str = "stock"):
             err = bundle.get("error")
             if err:
                 errors.append(str(err))
+
+        code = stock_symbol.replace(".TW", "").replace(".TWO", "").strip()
+        is_tw = stock_symbol.endswith((".TW", ".TWO")) or raw_symbol.isdigit()
+        fund = fetch_tw_fundamentals_finmind(code) if is_tw and code.isdigit() else {"pe": None, "pb": None, "eps": None}
+        pe = fund.get("pe")
+        pb = fund.get("pb")
+        eps = fund.get("eps")
+        qn = quote.get("name") or stock_symbol
+        if is_tw and code.isdigit():
+            tw_fb = qn if qn and qn != stock_symbol else None
+            detail_name = resolve_tw_display_name(code, fallback_zh=tw_fb)
+            valuation_val: Optional[str] = valuation_label(
+                pe=pe,
+                pb=pb,
+                eps=eps,
+                price=quote.get("price"),
+                lang="zh",
+            )
+        else:
+            detail_name = qn
+            valuation_val = None
+
         return {
             "symbol": stock_symbol,
             "raw_symbol": raw_symbol,
-            "name": quote.get("name") or stock_symbol,
+            "name": detail_name,
             "market": market_label,
             "industry": "N/A",
             "sector": "N/A",
@@ -500,14 +534,14 @@ def get_detail_data(symbol: str, market: str = "stock"):
             "market_cap": None,
             "fifty_two_week_high": hi,
             "fifty_two_week_low": lo,
-            "pe": None,
-            "pb": None,
-            "eps": None,
+            "pe": pe,
+            "pb": pb,
+            "eps": eps,
             "roe": None,
             "gross": None,
             "revenue": None,
             "debt": None,
-            "valuation": None,
+            "valuation": valuation_val,
             "currency": quote.get("currency"),
             "exchange": quote.get("exchange"),
             "interval": "1d",
@@ -740,6 +774,7 @@ def get_market_data(symbol: str, market: str = "US", interval: str = "1d", perio
                 "resistance": None,
                 "pe": None,
                 "pb": None,
+                "eps": None,
                 "hist": pd.DataFrame(),
             }
 
@@ -769,6 +804,7 @@ def get_market_data(symbol: str, market: str = "US", interval: str = "1d", perio
                 "resistance": None,
                 "pe": None,
                 "pb": None,
+                "eps": None,
                 "hist": pd.DataFrame(),
             }
 
@@ -777,15 +813,36 @@ def get_market_data(symbol: str, market: str = "US", interval: str = "1d", perio
         support = safe_float(recent["Low"].min()) if not recent.empty else None
         resistance = safe_float(recent["High"].max()) if not recent.empty else None
 
+        pe_v: Optional[float] = None
+        pb_v: Optional[float] = None
+        eps_v: Optional[float] = None
+        display_name: str = raw_symbol
+
+        if market_upper == "TW":
+            code = yf_symbol.replace(".TW", "").replace(".TWO", "").strip()
+            fund = fetch_tw_fundamentals_finmind(code)
+            pe_v = fund.get("pe")
+            pb_v = fund.get("pb")
+            eps_v = fund.get("eps")
+            snap_name = None
+            try:
+                snap = fetch_tw_mis_snapshot(yf_symbol)
+                if snap:
+                    snap_name = snap.get("name")
+            except Exception:
+                pass
+            display_name = resolve_tw_display_name(code, fallback_zh=snap_name)
+
         return {
             "raw_symbol": raw_symbol,
-            "name": raw_symbol,
+            "name": display_name,
             "market": market_upper,
             "price": latest_close,
             "support": support,
             "resistance": resistance,
-            "pe": None,
-            "pb": None,
+            "pe": pe_v,
+            "pb": pb_v,
+            "eps": eps_v,
             "hist": hist,
         }
     except Exception as e:
@@ -799,6 +856,7 @@ def get_market_data(symbol: str, market: str = "US", interval: str = "1d", perio
             "resistance": None,
             "pe": None,
             "pb": None,
+            "eps": None,
             "hist": pd.DataFrame(),
         }
 
