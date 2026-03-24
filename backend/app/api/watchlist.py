@@ -6,6 +6,7 @@ from app.models.watchlist import Watchlist
 from app.models.user import User
 from app.schemas.watchlist import (
     WatchlistCreate,
+    WatchlistDeleteBySymbol,
     WatchlistResponse,
     WatchlistOverviewItem,
     WatchlistOverviewResponse,
@@ -13,12 +14,28 @@ from app.schemas.watchlist import (
 from app.core.security import get_current_user
 from app.services.scanner_service import get_tw_symbol_to_chinese_only
 from app.services.fundamental_provider import format_tw_display_name
-from app.services.market_service import get_quote_data
+from app.services.market_service import (
+    get_quote_data,
+    normalize_crypto_symbol,
+    normalize_stock_symbol,
+)
+from app.services.stock_fundamental_service import get_tw_fundamental_bundle_cached
 
 import math
 import time
 
 router = APIRouter(prefix="/watchlist", tags=["watchlist"])
+
+
+def normalize_watchlist_symbol(symbol: str, market: str) -> str:
+    """與行情層一致：TW→2330.TW、CRYPTO→XXXUSDT、US→大寫代號。"""
+    m = str(market).strip().upper()
+    s = str(symbol).strip().upper()
+    if m == "TW":
+        return normalize_stock_symbol(s)
+    if m == "CRYPTO":
+        return normalize_crypto_symbol(s)
+    return s.replace(".TW", "").replace(".TWO", "").strip() or s
 
 
 def _tw_list_display_name(symbol: str) -> str | None:
@@ -33,6 +50,14 @@ def _tw_list_display_name(symbol: str) -> str | None:
     if not zh or zh == code:
         return code
     return format_tw_display_name(zh, code)
+
+
+def _list_display_name(symbol: str, market: str) -> str:
+    """列表／overview 必回傳 name：台股中文，其餘市場用代號。"""
+    m = str(market).strip().upper()
+    if m == "TW":
+        return _tw_list_display_name(symbol) or symbol
+    return symbol
 
 
 def get_db():
@@ -88,16 +113,15 @@ def add_watchlist(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
-    symbol = data.symbol.strip().upper()
+    symbol = normalize_watchlist_symbol(data.symbol, data.market)
 
     existing = db.query(Watchlist).filter(
         Watchlist.user_id == current_user.id,
-        Watchlist.symbol == symbol,
-        Watchlist.market == data.market
-    ).first()
-
-    if existing:
-        raise HTTPException(status_code=400, detail="Symbol already exists in watchlist")
+        Watchlist.market == data.market,
+    ).all()
+    for row in existing:
+        if normalize_watchlist_symbol(row.symbol, row.market) == symbol:
+            raise HTTPException(status_code=400, detail="Symbol already exists in watchlist")
 
     item = Watchlist(
         user_id=current_user.id,
@@ -107,13 +131,12 @@ def add_watchlist(
     db.add(item)
     db.commit()
     db.refresh(item)
-    name = _tw_list_display_name(symbol) if data.market == "TW" else None
     return WatchlistResponse(
         id=item.id,
         user_id=item.user_id,
         symbol=item.symbol,
         market=item.market,
-        name=name,
+        name=_list_display_name(item.symbol, item.market),
     )
 
 from typing import Literal
@@ -137,12 +160,40 @@ def get_watchlist(
         WatchlistResponse(
             id=w.id,
             user_id=w.user_id,
-            symbol=w.symbol,
+            symbol=normalize_watchlist_symbol(w.symbol, w.market),
             market=w.market,
-            name=_tw_list_display_name(w.symbol) if w.market == "TW" else None,
+            name=_list_display_name(w.symbol, w.market),
         )
         for w in items
     ]
+
+
+@router.delete("/by-symbol")
+def delete_watchlist_by_symbol(
+    data: WatchlistDeleteBySymbol,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """以正規化後的 symbol + market 刪除（相容 DB 內 2330 / 2330.TW 等舊格式）。"""
+    norm = normalize_watchlist_symbol(data.symbol, data.market)
+    raw = str(data.symbol).strip().upper()
+    item = (
+        db.query(Watchlist)
+        .filter(
+            Watchlist.user_id == current_user.id,
+            Watchlist.market == data.market,
+            Watchlist.symbol.in_([norm, raw]),
+        )
+        .first()
+    )
+    if not item:
+        raise HTTPException(status_code=404, detail="Watchlist item not found")
+
+    deleted_id = item.id
+    db.delete(item)
+    db.commit()
+    return {"message": "Deleted successfully", "id": deleted_id}
+
 
 @router.delete("/{watchlist_id}")
 def delete_watchlist(
@@ -160,7 +211,7 @@ def delete_watchlist(
 
     db.delete(item)
     db.commit()
-    return {"message": "Deleted successfully"}
+    return {"message": "Deleted successfully", "id": watchlist_id}
 
 
 @router.get("/overview", response_model=WatchlistOverviewResponse)
@@ -177,17 +228,28 @@ def get_watchlist_overview(
         # 行情層已有 60s 快取；保留少量間隔降低外部 API 瞬間壓力
         if idx > 0:
             time.sleep(0.08)
-        quote = _build_quote_data(item.symbol, item.market or "US")
-        name = _tw_list_display_name(item.symbol) if item.market == "TW" else None
+        mkt = item.market or "US"
+        sym_out = normalize_watchlist_symbol(item.symbol, mkt)
+        quote = _build_quote_data(sym_out, mkt)
+        pb = eps = None
+        if mkt == "TW":
+            try:
+                fund = get_tw_fundamental_bundle_cached(sym_out)
+                pb = _safe_float(fund.get("pb"))
+                eps = _safe_float(fund.get("eps"))
+            except Exception:
+                pass
         result.append(
             WatchlistOverviewItem(
                 id=item.id,
-                symbol=item.symbol,
+                symbol=sym_out,
                 market=item.market,
-                name=name,
+                name=_list_display_name(item.symbol, mkt),
                 price=quote["price"],
                 change=quote["change"],
                 change_percent=quote["change_percent"],
+                pb=pb,
+                eps=eps,
             )
         )
 
