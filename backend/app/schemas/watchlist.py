@@ -19,9 +19,17 @@ class WatchlistResponse(WatchlistBase):
     id: int
     user_id: int
     name: str = Field(..., description="顯示名稱；台股為中文簡稱，其餘市場為代號")
+    sort_order: int = Field(0, description="同一 market 內順序，數字越小越前面")
 
     class Config:
         from_attributes = True
+
+
+class WatchlistReorder(BaseModel):
+    """依指定 id 順序重排該 market 下全部自選股（須包含該 market 所有項目 id）。"""
+
+    market: Literal["TW", "US", "CRYPTO"]
+    ordered_ids: list[int] = Field(..., min_length=1)
 
 
 class WatchlistOverviewItem(BaseModel):
@@ -29,6 +37,7 @@ class WatchlistOverviewItem(BaseModel):
     symbol: str
     market: Literal["TW", "US", "CRYPTO"]
     name: str = Field(..., description="顯示名稱；台股為中文簡稱，其餘市場為代號")
+    sort_order: int = Field(0, description="同一 market 內順序")
     price: float | None = None
     change: float | None = None
     change_percent: float | None = None

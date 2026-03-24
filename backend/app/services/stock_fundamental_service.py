@@ -105,6 +105,33 @@ def _upsert_bundle(db, symbol: str, market: str, bundle: dict[str, Any]) -> Stoc
     return row
 
 
+def get_tw_fundamental_bundle_db_only(raw_symbol: str) -> dict[str, Any]:
+    """
+    僅讀 stock_fundamentals，不觸發 FinMind（供 detail / overview 等即時 API）。
+    無列或過期列時回傳空欄位結構，由前端顯示「—」；排程或手動同步後才有值。
+    """
+    sym = _normalize_tw_symbol(raw_symbol)
+    code = _code_from_symbol(sym)
+    if not code.isdigit():
+        return _empty_bundle(code)
+
+    db = SessionLocal()
+    try:
+        row = (
+            db.query(StockFundamental)
+            .filter(
+                StockFundamental.symbol == sym,
+                StockFundamental.market == "TW",
+            )
+            .first()
+        )
+        if row is not None:
+            return _row_to_bundle(row, code)
+    finally:
+        db.close()
+    return _empty_bundle(code)
+
+
 def get_tw_fundamental_bundle_cached(raw_symbol: str) -> dict[str, Any]:
     """
     與 fetch_tw_fundamental_bundle 相同欄位；優先 DB，過期／無列才 FinMind。
@@ -222,6 +249,7 @@ def run_tw_fundamentals_daily_sync() -> None:
 
 __all__ = [
     "get_tw_fundamental_bundle_cached",
+    "get_tw_fundamental_bundle_db_only",
     "run_tw_fundamentals_daily_sync",
     "_normalize_tw_symbol",
 ]

@@ -178,7 +178,14 @@ def _extract_pbr(row: dict) -> Optional[float]:
 
 def _extract_eps(row: dict) -> Optional[float]:
     low = {str(k).lower(): v for k, v in row.items()}
-    for k in ("eps", "每股盈餘", "revenue_per_share"):
+    for k in (
+        "eps",
+        "每股盈餘",
+        "revenue_per_share",
+        "earning_per_share",
+        "reference_eps",
+        "近四季每股盈餘",
+    ):
         if k in low:
             v = _to_float(low[k])
             if v is not None:
@@ -415,11 +422,13 @@ def fetch_tw_fundamental_bundle(stock_code: str) -> dict[str, Any]:
 
     # --- 市價指標：PER + PBR（同一 dataset TaiwanStockPER；v4 已廢除 TaiwanStockPB）---
     per_rows = _load_dataset_rows("TaiwanStockPER", code, start_market, end)
+    eps_from_per: Optional[float] = None
     if per_rows:
         r = _latest_row(per_rows)
         if r:
             out["pe"] = _extract_per(r)
             out["pb"] = _extract_pbr(r)
+            eps_from_per = _extract_eps(r)
 
     # --- TaiwanStockInfo：股名、產業 ---
     info_row = _fetch_single_tw_stock_info_row(code)
@@ -443,7 +452,9 @@ def fetch_tw_fundamental_bundle(stock_code: str) -> dict[str, Any]:
     fin_rows = _load_dataset_rows("TaiwanStockFinancialStatements", code, start_fin, end)
     fin_by = _pivot_long_by_date(fin_rows)
     out["gross_margin"] = _latest_quarter_gross_margin_ratio(fin_by)
-    out["eps"] = _latest_quarter_eps(fin_by)
+    fin_eps = _latest_quarter_eps(fin_by)
+    # PER 表若含 EPS 優先（與本益比口徑一致）；否則用綜合損益表單季 EPS
+    out["eps"] = eps_from_per if eps_from_per is not None else fin_eps
     ttm_ni = _ttm_income_after_tax(fin_by)
 
     # --- 資產負債表：負債比、ROE 分母 ---
@@ -609,14 +620,14 @@ def strip_tw_trailing_code_in_name(name: str, code: str) -> str:
 
 
 def format_tw_display_name(zh_name: Optional[str], code: str) -> str:
-    """台股顯示：台積電 (2330)；無中文或名稱等於代號則只回傳 code。"""
+    """台股顯示：台積電（2330）；無中文或名稱等於代號則只回傳 code。主標題用全形括號。"""
     c = str(code).replace(".TW", "").replace(".TWO", "").strip()
     if not zh_name or not str(zh_name).strip():
         return c
     z = strip_tw_trailing_code_in_name(str(zh_name).strip(), c)
     if not z or z == c:
         return c
-    return f"{z} ({c})"
+    return f"{z}（{c}）"
 
 
 def resolve_tw_display_name(stock_code: str, fallback_zh: Optional[str] = None) -> str:

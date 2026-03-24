@@ -1,4 +1,7 @@
+from typing import Literal
+
 from fastapi import APIRouter, Depends, HTTPException
+from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from app.db.database import SessionLocal
@@ -7,6 +10,7 @@ from app.models.user import User
 from app.schemas.watchlist import (
     WatchlistCreate,
     WatchlistDeleteBySymbol,
+    WatchlistReorder,
     WatchlistResponse,
     WatchlistOverviewItem,
     WatchlistOverviewResponse,
@@ -18,7 +22,7 @@ from app.services.market_service import (
     normalize_crypto_symbol,
     normalize_stock_symbol,
 )
-from app.services.stock_fundamental_service import get_tw_fundamental_bundle_cached
+from app.services.stock_fundamental_service import get_tw_fundamental_bundle_db_only
 
 import math
 import time
@@ -81,7 +85,7 @@ def _safe_float(value):
 
 def _build_quote_data(symbol: str, market: str = "US"):
     """
-    與 /market/quote 相同資料層：台股 TWSE 官方 + MIS、美股 Yahoo、加密 Bybit→Binance。
+    與 /market/quote 相同資料層：台股 TWSE 官方 + MIS、美股 Yahoo、加密預設 Binance（見 CRYPTO_*）。
     不再使用 yfinance 直連，避免與行情 API 重複且策略不一致。
     """
     m = str(market or "US").strip().upper()
@@ -122,10 +126,21 @@ def add_watchlist(
         if normalize_watchlist_symbol(row.symbol, row.market) == symbol:
             raise HTTPException(status_code=400, detail="Symbol already exists in watchlist")
 
+    mx = (
+        db.query(func.max(Watchlist.sort_order))
+        .filter(
+            Watchlist.user_id == current_user.id,
+            Watchlist.market == data.market,
+        )
+        .scalar()
+    )
+    next_order = (int(mx) if mx is not None else -1) + 1
+
     item = Watchlist(
         user_id=current_user.id,
         symbol=symbol,
-        market=data.market
+        market=data.market,
+        sort_order=next_order,
     )
     db.add(item)
     db.commit()
@@ -136,9 +151,9 @@ def add_watchlist(
         symbol=item.symbol,
         market=item.market,
         name=_list_display_name(item.symbol, item.market),
+        sort_order=item.sort_order,
     )
 
-from typing import Literal
 
 @router.get("", response_model=list[WatchlistResponse])
 @router.get("/", response_model=list[WatchlistResponse])
@@ -154,7 +169,7 @@ def get_watchlist(
     if market:
         query = query.filter(Watchlist.market == market)
 
-    items = query.all()
+    items = query.order_by(Watchlist.sort_order.asc(), Watchlist.id.asc()).all()
     return [
         WatchlistResponse(
             id=w.id,
@@ -162,8 +177,54 @@ def get_watchlist(
             symbol=normalize_watchlist_symbol(w.symbol, w.market),
             market=w.market,
             name=_list_display_name(w.symbol, w.market),
+            sort_order=w.sort_order,
         )
         for w in items
+    ]
+
+
+@router.put("/reorder", response_model=list[WatchlistResponse])
+def reorder_watchlist(
+    data: WatchlistReorder,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """依指定 id 順序重排該 market 下全部自選股；ordered_ids 須與該 market 目前項目 id 集合完全一致（可含重複 id，會去重）。"""
+    mkt = data.market
+    existing = (
+        db.query(Watchlist)
+        .filter(Watchlist.user_id == current_user.id, Watchlist.market == mkt)
+        .all()
+    )
+    id_set = {r.id for r in existing}
+    ordered = list(dict.fromkeys(data.ordered_ids))
+    if not id_set:
+        raise HTTPException(status_code=400, detail="此 market 尚無自選股")
+    if len(ordered) != len(id_set) or set(ordered) != id_set:
+        raise HTTPException(
+            status_code=400,
+            detail="ordered_ids 必須與該 market 下目前所有自選股 id 完全一致",
+        )
+    id_to_row = {r.id: r for r in existing}
+    for i, wid in enumerate(ordered):
+        id_to_row[wid].sort_order = i
+    db.commit()
+    rows = (
+        db.query(Watchlist)
+        .filter(Watchlist.user_id == current_user.id, Watchlist.market == mkt)
+        .order_by(Watchlist.sort_order.asc(), Watchlist.id.asc())
+        .all()
+    )
+    return [
+        WatchlistResponse(
+            id=w.id,
+            user_id=w.user_id,
+            symbol=normalize_watchlist_symbol(w.symbol, w.market),
+            market=w.market,
+            name=_list_display_name(w.symbol, w.market),
+            sort_order=w.sort_order,
+        )
+        for w in rows
     ]
 
 
@@ -218,9 +279,12 @@ def get_watchlist_overview(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
-    items = db.query(Watchlist).filter(
-        Watchlist.user_id == current_user.id
-    ).all()
+    items = (
+        db.query(Watchlist)
+        .filter(Watchlist.user_id == current_user.id)
+        .order_by(Watchlist.sort_order.asc(), Watchlist.id.asc())
+        .all()
+    )
 
     result = []
     for idx, item in enumerate(items):
@@ -233,7 +297,7 @@ def get_watchlist_overview(
         pb = eps = None
         if mkt == "TW":
             try:
-                fund = get_tw_fundamental_bundle_cached(sym_out)
+                fund = get_tw_fundamental_bundle_db_only(sym_out)
                 pb = _safe_float(fund.get("pb"))
                 eps = _safe_float(fund.get("eps"))
             except Exception:
@@ -244,6 +308,7 @@ def get_watchlist_overview(
                 symbol=sym_out,
                 market=item.market,
                 name=_list_display_name(item.symbol, mkt),
+                sort_order=item.sort_order,
                 price=quote["price"],
                 change=quote["change"],
                 change_percent=quote["change_percent"],

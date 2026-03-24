@@ -571,17 +571,34 @@ def get_binance_kline(symbol: str, interval: str = "D", limit: int = 120) -> pd.
 
 
 def get_crypto_kline_with_fallback(symbol: str, interval: str = "D", limit: int = 120) -> tuple[pd.DataFrame, str]:
-    """先 Bybit，失敗則 Binance。不使用 Yahoo。回傳 (DataFrame, 'BYBIT'|'BINANCE')"""
-    try:
-        return get_bybit_kline(symbol, interval, limit), "BYBIT"
-    except Exception as e:
-        print("[crypto] provider=BYBIT kline failed, fallback=BINANCE", symbol, repr(e))
+    """
+    預設 Binance 主來源（避免先打 Bybit 再 403）；Bybit 可選備援。
+    環境變數：CRYPTO_KLINE_PRIMARY=binance|bybit，CRYPTO_ENABLE_BYBIT_FALLBACK=true|false
+    """
+    primary = os.getenv("CRYPTO_KLINE_PRIMARY", "binance").strip().lower()
+    if primary == "bybit":
         try:
-            return get_binance_kline(symbol, interval, limit), "BINANCE"
-        except Exception as e2:
-            raise ValueError(
-                f"加密 K 線暫時無法取得（Bybit 與 Binance 皆失敗）: {symbol}"
-            ) from e2
+            return get_bybit_kline(symbol, interval, limit), "BYBIT"
+        except Exception as e:
+            print("[crypto] BYBIT kline primary failed, fallback BINANCE", symbol, repr(e))
+            try:
+                return get_binance_kline(symbol, interval, limit), "BINANCE"
+            except Exception as e2:
+                raise ValueError(
+                    f"加密 K 線暫時無法取得（Bybit 與 Binance 皆失敗）: {symbol}"
+                ) from e2
+    try:
+        return get_binance_kline(symbol, interval, limit), "BINANCE"
+    except Exception as e:
+        print("[crypto] BINANCE kline primary failed", symbol, repr(e))
+        if os.getenv("CRYPTO_ENABLE_BYBIT_FALLBACK", "true").lower() in ("1", "true", "yes", "on"):
+            try:
+                return get_bybit_kline(symbol, interval, limit), "BYBIT"
+            except Exception as e2:
+                raise ValueError(
+                    f"加密 K 線暫時無法取得（Binance 與 Bybit 皆失敗）: {symbol}"
+                ) from e2
+        raise ValueError(f"加密 K 線暫時無法取得: {symbol}") from e
 
 
 def get_binance_spot_tickers_normalized() -> List[Dict[str, Any]]:
@@ -617,11 +634,18 @@ def get_binance_spot_tickers_normalized() -> List[Dict[str, Any]]:
 
 
 def get_spot_tickers_with_fallback() -> List[Dict[str, Any]]:
+    primary = os.getenv("CRYPTO_TICKERS_PRIMARY", "binance").strip().lower()
+    if primary == "bybit":
+        try:
+            return get_bybit_spot_tickers()
+        except Exception as e:
+            print("WARN Bybit spot tickers failed, using Binance:", repr(e))
+            return get_binance_spot_tickers_normalized()
     try:
-        return get_bybit_spot_tickers()
-    except Exception as e:
-        print("WARN Bybit spot tickers failed, using Binance:", repr(e))
         return get_binance_spot_tickers_normalized()
+    except Exception as e:
+        print("WARN Binance spot tickers failed, using Bybit:", repr(e))
+        return get_bybit_spot_tickers()
 
 
 def _fetch_twse_stock_day_all() -> List[Dict[str, Any]]:

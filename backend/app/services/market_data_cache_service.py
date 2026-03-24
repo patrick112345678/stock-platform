@@ -9,6 +9,7 @@ import io
 import os
 import threading
 from datetime import datetime, timedelta
+from time import monotonic
 from typing import Any, Callable, Optional
 
 import pandas as pd
@@ -23,6 +24,69 @@ _locks_lock = threading.Lock()
 CHART_CANONICAL_INTERVAL = "1d"
 CHART_CANONICAL_PERIOD = "2y"
 CRYPTO_BARS_PERIOD = "bars200"
+
+# 程序內短期快取：同一 symbol 在短時間內多次 endpoint（quote/detail/chart/signal）共用，減少重複讀 DB／重算
+_HOT_HIST: dict[str, tuple[float, pd.DataFrame]] = {}
+_HOT_QUOTE: dict[str, tuple[float, dict[str, Any]]] = {}
+_HOT_LOCK = threading.Lock()
+
+
+def _hot_ttl_seconds() -> float:
+    try:
+        return float(os.getenv("MARKET_HOT_CACHE_SECONDS", "45"))
+    except ValueError:
+        return 45.0
+
+
+def _hot_hist_key(symbol: str, market: str) -> str:
+    return f"{market}:{symbol}:{CHART_CANONICAL_INTERVAL}:{CHART_CANONICAL_PERIOD}"
+
+
+def _hot_quote_key(symbol: str, market: str) -> str:
+    return f"Q:{market}:{symbol}"
+
+
+def _hot_get_hist(key: str) -> Optional[pd.DataFrame]:
+    t0 = monotonic()
+    with _HOT_LOCK:
+        ent = _HOT_HIST.get(key)
+        if not ent:
+            return None
+        ts, df = ent
+        if t0 - ts > _hot_ttl_seconds():
+            del _HOT_HIST[key]
+            return None
+        try:
+            return df.copy()
+        except Exception:
+            return None
+
+
+def _hot_set_hist(key: str, df: pd.DataFrame) -> None:
+    if df is None or df.empty:
+        return
+    with _HOT_LOCK:
+        _HOT_HIST[key] = (monotonic(), df.copy())
+
+
+def _hot_get_quote(key: str) -> Optional[dict[str, Any]]:
+    t0 = monotonic()
+    with _HOT_LOCK:
+        ent = _HOT_QUOTE.get(key)
+        if not ent:
+            return None
+        ts, d = ent
+        if t0 - ts > _hot_ttl_seconds():
+            del _HOT_QUOTE[key]
+            return None
+        return dict(d)
+
+
+def _hot_set_quote(key: str, data: dict[str, Any]) -> None:
+    if not data:
+        return
+    with _HOT_LOCK:
+        _HOT_QUOTE[key] = (monotonic(), dict(data))
 
 
 def try_read_fresh_stock_hist_from_chart_cache(symbol: str, market: str) -> Optional[pd.DataFrame]:
@@ -256,11 +320,17 @@ def get_or_refresh_stock_quote(
     market: str,
     fetch_live: Callable[[], dict[str, Any]],
 ) -> dict[str, Any]:
+    hq = _hot_get_quote(_hot_quote_key(symbol, market))
+    if hq is not None:
+        return hq
+
     lk = _get_lock(_lock_key(symbol, market))
     with lk:
         row = read_price_row(symbol, market)
         if row and is_fresh(row.updated_at, _price_ttl_minutes()):
-            return price_row_to_quote_dict(row)
+            out = price_row_to_quote_dict(row)
+            _hot_set_quote(_hot_quote_key(symbol, market), out)
+            return out
         data = fetch_live()
         upsert_price_row(
             symbol,
@@ -274,6 +344,7 @@ def get_or_refresh_stock_quote(
             exchange=data.get("exchange"),
             name=data.get("name"),
         )
+        _hot_set_quote(_hot_quote_key(symbol, market), data)
         return data
 
 
@@ -289,19 +360,27 @@ def get_or_refresh_stock_hist_df(
     market: str,
     fetch_live: Callable[[], Optional[pd.DataFrame]],
 ) -> Optional[pd.DataFrame]:
+    hk = _hot_hist_key(symbol, market)
+    mem = _hot_get_hist(hk)
+    if mem is not None:
+        return mem
+
     lk = _get_lock(_lock_key(symbol, market))
     with lk:
         row = read_chart_row(symbol, market, CHART_CANONICAL_INTERVAL, CHART_CANONICAL_PERIOD)
         if row and is_fresh(row.updated_at, _chart_ttl_minutes()):
             try:
-                return chart_row_to_df(row)
+                df = chart_row_to_df(row)
+                _hot_set_hist(hk, df)
+                return df.copy()
             except Exception:
                 pass
         df = fetch_live()
         if df is None or df.empty:
             return None
         upsert_chart_df(symbol, market, CHART_CANONICAL_INTERVAL, CHART_CANONICAL_PERIOD, df)
-        return df
+        _hot_set_hist(hk, df)
+        return df.copy()
 
 
 def get_or_refresh_crypto_kline_df(
@@ -309,19 +388,27 @@ def get_or_refresh_crypto_kline_df(
     interval: str,
     fetch_live: Callable[[], pd.DataFrame],
 ) -> pd.DataFrame:
+    ck = f"CRYPTO:{symbol}:{interval}:{CRYPTO_BARS_PERIOD}"
+    mem = _hot_get_hist(ck)
+    if mem is not None:
+        return mem
+
     lk = _get_lock(_lock_key(symbol, "CRYPTO"))
     with lk:
         row = read_chart_row(symbol, "CRYPTO", interval, CRYPTO_BARS_PERIOD)
         if row and is_fresh(row.updated_at, _chart_ttl_minutes()):
             try:
-                return chart_row_to_df(row)
+                df = chart_row_to_df(row)
+                _hot_set_hist(ck, df)
+                return df.copy()
             except Exception:
                 pass
         df = fetch_live()
         if df is None or df.empty:
             return pd.DataFrame()
         upsert_chart_df(symbol, "CRYPTO", interval, CRYPTO_BARS_PERIOD, df)
-        return df
+        _hot_set_hist(ck, df)
+        return df.copy()
 
 
 def upsert_chart_from_scanner_df(df: pd.DataFrame, symbol: str, market: str) -> None:

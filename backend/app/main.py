@@ -7,7 +7,10 @@ from sqlalchemy import text
 from sqlalchemy.exc import SQLAlchemyError
 
 from app.db.database import engine, Base
-from app.db.migrations_runtime import ensure_users_plan_expires_column
+from app.db.migrations_runtime import (
+    ensure_users_plan_expires_column,
+    ensure_watchlist_sort_order_column,
+)
 import app.db.base
 from fastapi.middleware.cors import CORSMiddleware
 
@@ -38,6 +41,7 @@ def _init_db_sync() -> None:
     """於 lifespan 內以 thread 執行，避免阻塞 ASGI；勿在模組 import 時連線建表（Render 易 port scan timeout）。"""
     Base.metadata.create_all(bind=engine)
     ensure_users_plan_expires_column()
+    ensure_watchlist_sort_order_column()
 
 
 async def _init_db_async() -> None:
