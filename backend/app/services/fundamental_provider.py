@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import time
 from datetime import datetime, timedelta
 from typing import Any, Optional
@@ -596,12 +597,26 @@ def resolve_tw_stock_name_finmind(stock_code: str) -> Optional[str]:
     return None
 
 
-def format_tw_display_name(zh_name: Optional[str], code: str) -> str:
-    """台股顯示：台積電 (2330)；無中文則回傳 code。半形括號，避免與 symbol 重複串接時出現兩組代號。"""
+def strip_tw_trailing_code_in_name(name: str, code: str) -> str:
+    """若字串尾端已有 (代號) 或 （代號），剝除，避免重複組字。"""
+    s = (name or "").strip()
     c = str(code).replace(".TW", "").replace(".TWO", "").strip()
-    if zh_name and str(zh_name).strip():
-        return f"{str(zh_name).strip()} ({c})"
-    return c
+    if not s or not c:
+        return s
+    pat = re.compile(rf"\s*[（(]\s*{re.escape(c)}\s*[)）]\s*$")
+    t = pat.sub("", s).strip()
+    return t if t else s
+
+
+def format_tw_display_name(zh_name: Optional[str], code: str) -> str:
+    """台股顯示：台積電 (2330)；無中文或名稱等於代號則只回傳 code。"""
+    c = str(code).replace(".TW", "").replace(".TWO", "").strip()
+    if not zh_name or not str(zh_name).strip():
+        return c
+    z = strip_tw_trailing_code_in_name(str(zh_name).strip(), c)
+    if not z or z == c:
+        return c
+    return f"{z} ({c})"
 
 
 def resolve_tw_display_name(stock_code: str, fallback_zh: Optional[str] = None) -> str:
@@ -618,6 +633,7 @@ __all__ = [
     "fetch_tw_fundamental_bundle",
     "load_finmind_tw_stock_info_map",
     "resolve_tw_stock_name_finmind",
+    "strip_tw_trailing_code_in_name",
     "format_tw_display_name",
     "resolve_tw_display_name",
     "normalize_percent_ratio",

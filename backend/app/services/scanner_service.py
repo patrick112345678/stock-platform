@@ -10,6 +10,7 @@ import requests
 from app.services.stock_data_service import get_cached_stock_data
 from datetime import datetime, timedelta, time
 import json
+from app.services.fundamental_provider import strip_tw_trailing_code_in_name
 from app.db.database import SessionLocal
 from sqlalchemy import text
 
@@ -706,8 +707,11 @@ def _get_tw_search_raw_items() -> List[Dict[str, str]]:
 
 
 def format_tw_search_items_with_display(raw: List[Dict[str, str]]) -> List[Dict[str, str]]:
-    """FinMind 股名優先，顯示為 台積電（2330）。"""
-    from app.services.fundamental_provider import format_tw_display_name, load_finmind_tw_stock_info_map
+    """
+    FinMind 股名優先；name 僅中文簡稱，不含 (代號)。
+    前端常見寫法為 `{name} ({symbol})`，若此處已含括號會變成 (1783)(1783)。
+    """
+    from app.services.fundamental_provider import load_finmind_tw_stock_info_map
 
     finm = load_finmind_tw_stock_info_map()
     out: List[Dict[str, str]] = []
@@ -719,19 +723,19 @@ def format_tw_search_items_with_display(raw: List[Dict[str, str]]) -> List[Dict[
         if not zh or str(zh).strip() == sym:
             name = sym
         else:
-            name = format_tw_display_name(str(zh).strip(), sym)
+            name = strip_tw_trailing_code_in_name(str(zh).strip(), sym)
         out.append({"symbol": sym, "name": name})
     return out
 
 
 def get_tw_search_items() -> List[Dict[str, str]]:
-    """取得台股搜尋用清單（含代號與顯示名稱 台積電（2330）），供 /market/search 使用。優先 TWSE API，失敗則載入 tw_stock_master.json"""
+    """取得台股搜尋用清單（symbol + 中文簡稱 name，不含括號代號），供 /market/search 使用。優先 TWSE API，失敗則載入 tw_stock_master.json"""
     raw = _get_tw_search_raw_items()
     return format_tw_search_items_with_display(raw)
 
 
 def get_tw_symbol_to_name() -> Dict[str, str]:
-    """取得台股代號 -> 顯示名稱（優先 FinMind TaiwanStockInfo），格式：台積電（2330）；失敗則為代號。"""
+    """取得台股代號 -> 中文簡稱（與搜尋清單一致，不含括號代號）；失敗則為代號。"""
     raw = _get_tw_search_raw_items()
     formatted = format_tw_search_items_with_display(raw)
     return {x["symbol"]: x["name"] for x in formatted}
@@ -754,12 +758,12 @@ def get_tw_symbol_to_chinese_only() -> Dict[str, str]:
         if not zh or str(zh).strip() == sym:
             out[sym] = sym
         else:
-            out[sym] = str(zh).strip()
+            out[sym] = strip_tw_trailing_code_in_name(str(zh).strip(), sym)
     return out
 
 
 def enrich_tw_names(items: List[Dict[str, Any]], market: str = "TW") -> List[Dict[str, Any]]:
-    """為台股項目加入顯示名稱：台積電（2330）（有對照表時覆寫）"""
+    """為台股項目加入中文簡稱 name（不含括號代號，有對照表時覆寫）"""
     if market != "TW":
         return items
     name_map = get_tw_symbol_to_name()

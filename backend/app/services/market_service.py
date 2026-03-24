@@ -15,8 +15,9 @@ from typing import List, Dict, Any, Optional, Literal
 from app.schemas.market import MarketCandleItem, MarketChartResponse
 from app.services.stock_data_service import get_cached_stock_data, get_cached_data, NEUTRAL_DATA_ERROR
 from app.services.fundamental_provider import (
-    format_tw_display_name,
     resolve_tw_display_name,
+    resolve_tw_stock_name_finmind,
+    strip_tw_trailing_code_in_name,
     tw_percent_display_to_api_ratio,
 )
 from app.services.stock_fundamental_service import get_tw_fundamental_bundle_cached
@@ -579,11 +580,15 @@ def get_detail_data(symbol: str, market: str = "stock"):
             tw_fb = qn if qn and qn != stock_symbol else None
             zh = fund.get("stock_name_zh")
             if zh:
-                detail_name = str(fund.get("display_name") or "").strip() or format_tw_display_name(
-                    str(zh).strip(), code
-                )
+                raw_disp = str(fund.get("display_name") or "").strip()
+                base = raw_disp or str(zh).strip()
+                detail_name = strip_tw_trailing_code_in_name(base, code)
             else:
-                detail_name = resolve_tw_display_name(code, fallback_zh=tw_fb)
+                rn = resolve_tw_stock_name_finmind(code) or tw_fb
+                if rn and str(rn).strip() and str(rn).strip() != code:
+                    detail_name = strip_tw_trailing_code_in_name(str(rn).strip(), code)
+                else:
+                    detail_name = code
             pe = fund.get("pe")
             pb = fund.get("pb")
             eps = fund.get("eps")
