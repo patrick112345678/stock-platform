@@ -82,6 +82,47 @@ def _to_float(x: Any) -> Optional[float]:
         return None
 
 
+def normalize_percent_ratio(v: Optional[float]) -> Optional[float]:
+    """
+    統一為「31.41 代表 31.41%」的數值（API／前端顯示時只加 % 符號，不再乘 100）。
+    - |x| > 1：視為已是百分數（例如 31.41）
+    - |x| ≤ 1：視為小數比例（例如 0.3141 → 31.41）
+    """
+    if v is None:
+        return None
+    try:
+        x = float(v)
+    except (TypeError, ValueError):
+        return None
+    if abs(x) > 1:
+        return round(x, 4)
+    return round(x * 100.0, 4)
+
+
+def normalize_tw_percent_fields(bundle: dict[str, Any]) -> None:
+    """就地修正 roe / gross_margin / revenue_growth_yoy / debt_ratio。"""
+    for k in ("roe", "gross_margin", "revenue_growth_yoy", "debt_ratio"):
+        if k in bundle and bundle[k] is not None:
+            bundle[k] = normalize_percent_ratio(bundle.get(k))
+
+
+def apply_tw_fundamental_sanity(bundle: dict[str, Any]) -> None:
+    """排除明顯錯誤（如 ROE>100%、毛利率>100%）。"""
+    roe = bundle.get("roe")
+    if roe is not None and abs(float(roe)) > 100:
+        bundle["roe"] = None
+    gm = bundle.get("gross_margin")
+    if gm is not None:
+        g = float(gm)
+        if g < 0 or g > 100:
+            bundle["gross_margin"] = None
+    dr = bundle.get("debt_ratio")
+    if dr is not None:
+        d = float(dr)
+        if d < 0 or d > 100:
+            bundle["debt_ratio"] = None
+
+
 def _parse_date_key(row: dict) -> str:
     low = {str(k).lower(): v for k, v in row.items()}
     return str(low.get("date") or low.get("stock_date") or "")
@@ -229,7 +270,8 @@ def _latest_quarter_eps(fin_by_date: dict[str, dict[str, float]]) -> Optional[fl
     return _find_metric_substr(m, ("eps",))
 
 
-def _latest_quarter_gross_margin(fin_by_date: dict[str, dict[str, float]]) -> Optional[float]:
+def _latest_quarter_gross_margin_ratio(fin_by_date: dict[str, dict[str, float]]) -> Optional[float]:
+    """回傳毛利率小數比例（例如 0.3141），由 normalize_percent_ratio 轉成 31.41。"""
     if not fin_by_date:
         return None
     latest = max(fin_by_date.keys())
@@ -249,7 +291,7 @@ def _latest_quarter_gross_margin(fin_by_date: dict[str, dict[str, float]]) -> Op
         rev = _find_metric_substr(m, ("operating", "revenue"))
     if gp is None or rev is None or rev == 0:
         return None
-    return (gp / rev) * 100.0
+    return gp / rev
 
 
 def _latest_balance_ratios(bs_by_date: dict[str, dict[str, float]]) -> tuple[
@@ -282,19 +324,21 @@ def _latest_balance_ratios(bs_by_date: dict[str, dict[str, float]]) -> tuple[
     return ta, tl, te
 
 
-def _roe_percent(ttm_net: Optional[float], equity: Optional[float]) -> Optional[float]:
+def _roe_ratio(ttm_net: Optional[float], equity: Optional[float]) -> Optional[float]:
+    """稅後淨利／權益，為小數比例；normalize_percent_ratio 轉成百分數。"""
     if ttm_net is None or equity is None or equity == 0:
         return None
-    return (ttm_net / equity) * 100.0
+    return ttm_net / equity
 
 
-def _debt_ratio_percent(liab: Optional[float], assets: Optional[float]) -> Optional[float]:
+def _debt_ratio_raw(liab: Optional[float], assets: Optional[float]) -> Optional[float]:
+    """負債／資產，為小數比例。"""
     if liab is None or assets is None or assets == 0:
         return None
-    return (liab / assets) * 100.0
+    return liab / assets
 
 
-def _month_revenue_yoy(rows: list[dict]) -> Optional[float]:
+def _month_revenue_yoy_ratio(rows: list[dict]) -> Optional[float]:
     pts: list[tuple[str, float]] = []
     for r in rows:
         ds = _parse_date_key(r)
@@ -317,7 +361,7 @@ def _month_revenue_yoy(rows: list[dict]) -> Optional[float]:
             prev_rev = rev
     if prev_rev is None or prev_rev == 0:
         return None
-    return (last_rev - prev_rev) / prev_rev * 100.0
+    return (last_rev - prev_rev) / prev_rev
 
 
 def fetch_tw_fundamental_bundle(stock_code: str) -> dict[str, Any]:
@@ -379,7 +423,7 @@ def fetch_tw_fundamental_bundle(stock_code: str) -> dict[str, Any]:
     # --- 綜合損益：毛利率（單季）、EPS（v4 已廢除 TaiwanStockEPS，改由財報長表）---
     fin_rows = _load_dataset_rows("TaiwanStockFinancialStatements", code, start_fin, end)
     fin_by = _pivot_long_by_date(fin_rows)
-    out["gross_margin"] = _latest_quarter_gross_margin(fin_by)
+    out["gross_margin"] = _latest_quarter_gross_margin_ratio(fin_by)
     out["eps"] = _latest_quarter_eps(fin_by)
     ttm_ni = _ttm_income_after_tax(fin_by)
 
@@ -387,12 +431,15 @@ def fetch_tw_fundamental_bundle(stock_code: str) -> dict[str, Any]:
     bs_rows = _load_dataset_rows("TaiwanStockBalanceSheet", code, start_fin, end)
     bs_by = _pivot_long_by_date(bs_rows)
     ta, tl, te = _latest_balance_ratios(bs_by)
-    out["debt_ratio"] = _debt_ratio_percent(tl, ta)
-    out["roe"] = _roe_percent(ttm_ni, te)
+    out["debt_ratio"] = _debt_ratio_raw(tl, ta)
+    out["roe"] = _roe_ratio(ttm_ni, te)
 
     # --- 月營收：年增率 ---
     rev_rows = _load_dataset_rows("TaiwanStockMonthRevenue", code, start_month, end)
-    out["revenue_growth_yoy"] = _month_revenue_yoy(rev_rows)
+    out["revenue_growth_yoy"] = _month_revenue_yoy_ratio(rev_rows)
+
+    normalize_tw_percent_fields(out)
+    apply_tw_fundamental_sanity(out)
 
     return out
 
@@ -532,10 +579,10 @@ def resolve_tw_stock_name_finmind(stock_code: str) -> Optional[str]:
 
 
 def format_tw_display_name(zh_name: Optional[str], code: str) -> str:
-    """台股顯示：台積電（2330）；無中文則回傳 code。"""
+    """台股顯示：台積電 (2330)；無中文則回傳 code。半形括號，避免與 symbol 重複串接時出現兩組代號。"""
     c = str(code).replace(".TW", "").replace(".TWO", "").strip()
     if zh_name and str(zh_name).strip():
-        return f"{str(zh_name).strip()}（{c}）"
+        return f"{str(zh_name).strip()} ({c})"
     return c
 
 
@@ -555,4 +602,7 @@ __all__ = [
     "resolve_tw_stock_name_finmind",
     "format_tw_display_name",
     "resolve_tw_display_name",
+    "normalize_percent_ratio",
+    "normalize_tw_percent_fields",
+    "apply_tw_fundamental_sanity",
 ]

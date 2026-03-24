@@ -14,8 +14,10 @@ from typing import Any, Optional
 from app.db.database import SessionLocal
 from app.models.stock_fundamental import StockFundamental
 from app.services.fundamental_provider import (
+    apply_tw_fundamental_sanity,
     fetch_tw_fundamental_bundle,
     format_tw_display_name,
+    normalize_tw_percent_fields,
 )
 
 _log = logging.getLogger(__name__)
@@ -54,7 +56,7 @@ def _is_fresh(updated_at: Optional[datetime]) -> bool:
 
 def _row_to_bundle(row: StockFundamental, code: str) -> dict[str, Any]:
     zh = row.name_zh
-    return {
+    out = {
         "pe": row.pe,
         "pb": row.pb,
         "eps": row.eps,
@@ -68,6 +70,9 @@ def _row_to_bundle(row: StockFundamental, code: str) -> dict[str, Any]:
         "valuation": None,
         "market_cap": row.market_cap,
     }
+    normalize_tw_percent_fields(out)
+    apply_tw_fundamental_sanity(out)
+    return out
 
 
 def _upsert_bundle(db, symbol: str, market: str, bundle: dict[str, Any]) -> StockFundamental:

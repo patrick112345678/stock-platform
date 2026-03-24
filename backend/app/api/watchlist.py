@@ -28,11 +28,12 @@ router = APIRouter(prefix="/watchlist", tags=["watchlist"])
 
 
 def normalize_watchlist_symbol(symbol: str, market: str) -> str:
-    """與行情層一致：TW→2330.TW、CRYPTO→XXXUSDT、US→大寫代號。"""
+    """DB 與 API 統一：TW 存純代號 2330；CRYPTO→XXXUSDT；US→大寫代號。行情層會自行補 .TW。"""
     m = str(market).strip().upper()
     s = str(symbol).strip().upper()
     if m == "TW":
-        return normalize_stock_symbol(s)
+        sym = normalize_stock_symbol(s)
+        return sym.replace(".TW", "").replace(".TWO", "").strip() or sym
     if m == "CRYPTO":
         return normalize_crypto_symbol(s)
     return s.replace(".TW", "").replace(".TWO", "").strip() or s
