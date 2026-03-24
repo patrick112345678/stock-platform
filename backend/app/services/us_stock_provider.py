@@ -1,14 +1,15 @@
 """
-美股日線：目前唯一實作為 Yahoo Finance（yfinance）。
-
-後續若要「主源改 Finnhub / Alpha Vantage、Yahoo 降為備援」，請在此檔新增主源 fetch，
-並讓 `fetch_us_history_yahoo_bounded` 僅在主源失敗時呼叫。
+美股日線：Yahoo Finance（yfinance）僅允許在此檔呼叫，並抑制函式庫印到 stderr 的雜訊（如 possibly delisted）。
+後續若要改主源為 Finnhub 等，請替換 fetch 實作並維持回傳 pandas DataFrame。
 """
 
 from __future__ import annotations
 
+import contextlib
+import io
+import logging
+import os
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeout
-from typing import Any
 
 import pandas as pd
 import yfinance as yf
@@ -20,16 +21,51 @@ except Exception:
 
 YFINANCE_FETCH_TIMEOUT = 5.0
 
+_YF_LOGGERS = (
+    "yfinance",
+    "yfinance.base",
+    "yfinance.ticker",
+    "yfinance.scrapers",
+    "yfinance.data",
+    "peewee",
+)
+
+
+def _silence_yfinance_loggers() -> None:
+    for name in _YF_LOGGERS:
+        lg = logging.getLogger(name)
+        lg.setLevel(logging.CRITICAL)
+        lg.disabled = True
+
+
+def _sanitize_yahoo_exception_message(msg: str) -> str:
+    """不將原生 Yahoo／yfinance 字串回傳給上層，避免 log 出現 possibly delisted 等。"""
+    s = (msg or "").lower()
+    if "delist" in s or "possibly delisted" in s:
+        return "yahoo_quote_unavailable"
+    if "quote not found" in s or "404" in s:
+        return "yahoo_quote_unavailable"
+    if "session" in s or "curl_cffi" in s:
+        return "yfinance_session_error"
+    return (msg or "")[:300]
+
 
 def fetch_us_history_yahoo(yf_symbol: str) -> pd.DataFrame:
-    """僅美股 ticker（如 AAPL），勿傳台股代號。"""
-    ticker = yf.Ticker(str(yf_symbol).strip())
-    return ticker.history(period="3mo", interval="1d", auto_adjust=False)
+    """僅美股 ticker（如 AAPL）；台股備援時傳 2330.TW 亦走此函式，但 stderr 已抑制。"""
+    _silence_yfinance_loggers()
+    sym = str(yf_symbol).strip()
+    if os.getenv("YFINANCE_DEBUG", "").lower() in ("1", "true", "yes"):
+        ticker = yf.Ticker(sym)
+        return ticker.history(period="3mo", interval="1d", auto_adjust=False)
+    stderr_buf = io.StringIO()
+    with contextlib.redirect_stderr(stderr_buf):
+        ticker = yf.Ticker(sym)
+        return ticker.history(period="3mo", interval="1d", auto_adjust=False)
 
 
 def fetch_us_history_yahoo_bounded(yf_symbol: str) -> tuple[pd.DataFrame | None, str | None]:
     """
-    有執行緒逾時保護。成功回傳 (df, None)，失敗回傳 (None, error_code_or_msg)。
+    有執行緒逾時保護。成功回傳 (df, None)，失敗回傳 (None, 簡短代碼) — 不含 yfinance 原文。
     """
     key = str(yf_symbol).strip().upper()
     try:
@@ -43,10 +79,7 @@ def fetch_us_history_yahoo_bounded(yf_symbol: str) -> tuple[pd.DataFrame | None,
     except FuturesTimeout:
         return None, "yfinance_timeout"
     except (YFDataException, Exception) as e:
-        err_msg = str(e)
-        if "session" in err_msg.lower() or "curl_cffi" in err_msg.lower():
-            err_msg = "yfinance_session_error"
-        return None, err_msg
+        return None, _sanitize_yahoo_exception_message(str(e))
 
     if df is None or df.empty:
         return None, "empty_history"

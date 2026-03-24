@@ -66,6 +66,7 @@ def _build_quote_data(symbol: str, market: str = "US"):
         }
 
 
+@router.post("", response_model=WatchlistResponse)
 @router.post("/", response_model=WatchlistResponse)
 def add_watchlist(
     data: WatchlistCreate,
@@ -103,6 +104,7 @@ def add_watchlist(
 
 from typing import Literal
 
+@router.get("", response_model=list[WatchlistResponse])
 @router.get("/", response_model=list[WatchlistResponse])
 def get_watchlist(
     market: Literal["TW", "US", "CRYPTO"] | None = None,

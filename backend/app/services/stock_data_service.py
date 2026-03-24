@@ -10,10 +10,13 @@
 
 from __future__ import annotations
 
+import logging
 import time
 from typing import Any, Dict, Tuple
 
 import pandas as pd
+
+_log = logging.getLogger(__name__)
 
 from app.services.twse_official_service import fetch_tw_daily_history_official
 from app.services.us_stock_provider import fetch_us_history_yahoo_bounded
@@ -36,7 +39,12 @@ def _sanitize_public_error(err: str | None) -> str:
     if "no data" in s and "yahoo" in s:
         return NEUTRAL_DATA_ERROR
     # 仍回傳簡短技術代碼時，改中性包裝
-    if err in ("empty_history", "yfinance_timeout", "yfinance_session_error"):
+    if err in (
+        "empty_history",
+        "yfinance_timeout",
+        "yfinance_session_error",
+        "yahoo_quote_unavailable",
+    ):
         return NEUTRAL_DATA_ERROR
     return str(err)[:500]
 
@@ -90,7 +98,7 @@ def _fetch_tw_stock_data(raw_key: str) -> Dict[str, Any]:
         hist_off = fetch_tw_daily_history_official(code, months_back=6)
         if hist_off is not None and not hist_off.empty and len(hist_off) >= 2:
             hist_off = _normalize_hist_columns(hist_off)
-            print(f"[market-data] TW provider=TWSE_OFFICIAL symbol={canon} rows={len(hist_off)}")
+            _log.info("market-data TW provider=TWSE_OFFICIAL symbol=%s rows=%s", canon, len(hist_off))
             return {
                 "ok": True,
                 "symbol": canon,
@@ -99,13 +107,13 @@ def _fetch_tw_stock_data(raw_key: str) -> Dict[str, Any]:
                 "provider": "TWSE_OFFICIAL",
             }
     except Exception as e:
-        print(f"[market-data] TWSE_OFFICIAL failed symbol={canon} err={e!r}")
+        _log.warning("market-data TWSE_OFFICIAL exception symbol=%s err=%s", canon, str(e)[:200])
 
-    # 2) 備援：Yahoo Finance
+    # 2) 備援：Yahoo Finance（僅能經 us_stock_provider）
     df, err = fetch_us_history_yahoo_bounded(canon)
     if df is not None and not df.empty:
         df = _normalize_hist_columns(df)
-        print(f"[market-data] TW provider=YAHOO_FALLBACK symbol={canon} rows={len(df)}")
+        _log.info("market-data TW provider=YAHOO_FALLBACK symbol=%s rows=%s", canon, len(df))
         return {
             "ok": True,
             "symbol": canon,
@@ -115,7 +123,7 @@ def _fetch_tw_stock_data(raw_key: str) -> Dict[str, Any]:
         }
 
     pub = _sanitize_public_error(err)
-    print(f"[market-data] TW failed symbol={canon} raw_err={err!r} public={pub}")
+    _log.warning("market-data TW failed symbol=%s reason=%s", canon, err)
     return {
         "ok": False,
         "symbol": canon,
@@ -131,7 +139,7 @@ def _fetch_us_stock_data(yf_symbol: str) -> Dict[str, Any]:
     df, err = fetch_us_history_yahoo_bounded(key)
     if df is not None and not df.empty:
         df = _normalize_hist_columns(df)
-        print(f"[market-data] US provider=YAHOO symbol={key} rows={len(df)}")
+        _log.info("market-data US provider=YAHOO symbol=%s rows=%s", key, len(df))
         return {
             "ok": True,
             "symbol": key,
@@ -140,7 +148,7 @@ def _fetch_us_stock_data(yf_symbol: str) -> Dict[str, Any]:
             "provider": "YAHOO",
         }
     pub = _sanitize_public_error(err)
-    print(f"[market-data] US failed symbol={key} raw_err={err!r} public={pub}")
+    _log.warning("market-data US failed symbol=%s reason=%s", key, err)
     return {
         "ok": False,
         "symbol": key,
