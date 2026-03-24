@@ -14,7 +14,11 @@ from typing import List, Dict, Any, Optional, Literal
 
 from app.schemas.market import MarketCandleItem, MarketChartResponse
 from app.services.stock_data_service import get_cached_stock_data, get_cached_data, NEUTRAL_DATA_ERROR
-from app.services.fundamental_provider import format_tw_display_name, resolve_tw_display_name
+from app.services.fundamental_provider import (
+    format_tw_display_name,
+    resolve_tw_display_name,
+    tw_percent_display_to_api_ratio,
+)
 from app.services.stock_fundamental_service import get_tw_fundamental_bundle_cached
 from app.services.technical_service import valuation_label
 from app.services.market_data_cache_service import (
@@ -43,24 +47,29 @@ CMC_API_KEY = os.getenv("CMC_API_KEY")
 PoolSize = Literal["TOP100", "TOP800", "ALL"]
 
 
-def _tw_fundamental_sections_and_completeness(fund: dict[str, Any]) -> tuple[dict[str, Any], float]:
-    """估值／獲利／成長／風險分類與 7 欄位完整度（0–100）。"""
-    pe, pb = fund.get("pe"), fund.get("pb")
-    eps = fund.get("eps")
-    roe = fund.get("roe")
-    gm = fund.get("gross_margin")
-    rg = fund.get("revenue_growth_yoy")
-    dr = fund.get("debt_ratio")
+def _tw_fundamental_sections_api(
+    fund: dict[str, Any], pe: Any, pb: Any, eps: Any
+) -> tuple[dict[str, Any], float, dict[str, Any]]:
+    """
+    估值／獲利／成長／風險分類與完整度。
+    ROE／毛利率／營收年增／負債比 以 tw_percent_display_to_api_ratio 輸出小數比例，避免前端再 *100 時放大 100 倍。
+    """
+    pr = {
+        "roe": tw_percent_display_to_api_ratio(fund.get("roe")),
+        "gross_margin": tw_percent_display_to_api_ratio(fund.get("gross_margin")),
+        "revenue_growth_yoy": tw_percent_display_to_api_ratio(fund.get("revenue_growth_yoy")),
+        "debt_ratio": tw_percent_display_to_api_ratio(fund.get("debt_ratio")),
+    }
     sections = {
         "valuation": {"pe": pe, "pb": pb},
-        "profitability": {"eps": eps, "roe": roe, "gross_margin": gm},
-        "growth": {"revenue_growth_yoy": rg},
-        "risk": {"debt_ratio": dr},
+        "profitability": {"eps": eps, "roe": pr["roe"], "gross_margin": pr["gross_margin"]},
+        "growth": {"revenue_growth_yoy": pr["revenue_growth_yoy"]},
+        "risk": {"debt_ratio": pr["debt_ratio"]},
     }
-    keys = [pe, pb, eps, roe, gm, rg, dr]
+    keys = [pe, pb, eps, pr["roe"], pr["gross_margin"], pr["revenue_growth_yoy"], pr["debt_ratio"]]
     n = sum(1 for x in keys if x is not None)
     completeness = round(100.0 * n / 7.0, 1)
-    return sections, completeness
+    return sections, completeness, pr
 
 
 def safe_float(value):
@@ -559,6 +568,12 @@ def get_detail_data(symbol: str, market: str = "stock"):
         fund = None
         fundamental: Optional[dict[str, Any]] = None
         fund_pct: Optional[float] = None
+        pr: dict[str, Any] = {
+            "roe": None,
+            "gross_margin": None,
+            "revenue_growth_yoy": None,
+            "debt_ratio": None,
+        }
         if is_tw and code.isdigit():
             fund = get_tw_fundamental_bundle_cached(stock_symbol)
             tw_fb = qn if qn and qn != stock_symbol else None
@@ -580,15 +595,15 @@ def get_detail_data(symbol: str, market: str = "stock"):
                 lang="zh",
             )
             ind = fund.get("industry")
-            sec, fund_pct = _tw_fundamental_sections_and_completeness(fund)
+            sec, fund_pct, pr = _tw_fundamental_sections_api(fund, pe, pb, eps)
             fundamental = {
                 "pe": fund.get("pe"),
                 "pb": fund.get("pb"),
                 "eps": fund.get("eps"),
-                "roe": fund.get("roe"),
-                "gross_margin": fund.get("gross_margin"),
-                "revenue_growth_yoy": fund.get("revenue_growth_yoy"),
-                "debt_ratio": fund.get("debt_ratio"),
+                "roe": pr["roe"],
+                "gross_margin": pr["gross_margin"],
+                "revenue_growth_yoy": pr["revenue_growth_yoy"],
+                "debt_ratio": pr["debt_ratio"],
                 "valuation": valuation_val,
                 "industry": ind,
                 "stock_name_zh": zh,
@@ -622,10 +637,10 @@ def get_detail_data(symbol: str, market: str = "stock"):
             "pe": pe,
             "pb": pb,
             "eps": eps,
-            "roe": fund.get("roe") if fund else None,
-            "gross": fund.get("gross_margin") if fund else None,
-            "revenue": fund.get("revenue_growth_yoy") if fund else None,
-            "debt": fund.get("debt_ratio") if fund else None,
+            "roe": pr["roe"] if fund else None,
+            "gross": pr["gross_margin"] if fund else None,
+            "revenue": pr["revenue_growth_yoy"] if fund else None,
+            "debt": pr["debt_ratio"] if fund else None,
             "valuation": valuation_val,
             "fundamental": fundamental,
             "fundamental_completeness_percent": fund_pct if is_tw and fundamental else None,

@@ -13,7 +13,6 @@ from app.schemas.watchlist import (
 )
 from app.core.security import get_current_user
 from app.services.scanner_service import get_tw_symbol_to_chinese_only
-from app.services.fundamental_provider import format_tw_display_name
 from app.services.market_service import (
     get_quote_data,
     normalize_crypto_symbol,
@@ -41,16 +40,15 @@ def normalize_watchlist_symbol(symbol: str, market: str) -> str:
 
 def _tw_list_display_name(symbol: str) -> str | None:
     """
-    台股自選股顯示名稱：台積電（2330）。
-    使用中文簡稱 + 代號單次組字，避免與 get_tw_symbol_to_name 重複括號邏輯。
-    前端請只顯示此欄位，勿再串 symbol。
+    台股自選股 name：僅中文簡稱（如 台積電），不含代號。
+    前端可顯示為 `{name} ({symbol})`；若 name 已含括號代號會與前端重複，故後端只給純中文。
     """
     code = symbol.replace(".TW", "").replace(".TWO", "").strip()
     cn_map = get_tw_symbol_to_chinese_only()
     zh = cn_map.get(code)
     if not zh or zh == code:
         return code
-    return format_tw_display_name(zh, code)
+    return str(zh).strip()
 
 
 def _list_display_name(symbol: str, market: str) -> str:

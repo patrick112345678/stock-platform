@@ -106,6 +106,24 @@ def normalize_tw_percent_fields(bundle: dict[str, Any]) -> None:
             bundle[k] = normalize_percent_ratio(bundle.get(k))
 
 
+def tw_percent_display_to_api_ratio(v: Optional[float]) -> Optional[float]:
+    """
+    將內部儲存的「百分數字」（如 22.56 代表 22.56%）轉成 API 用的小數比例（0.2256）。
+    若前端誤用 (value * 100) 再顯示 %，會把 22.56 變成 2256%；改傳 0.2256 則 *100 後為 22.56 正確。
+
+    若 |v|≤1 則視為已是小數比例（如 0.2256），原樣回傳。
+    """
+    if v is None:
+        return None
+    try:
+        x = float(v)
+    except (TypeError, ValueError):
+        return None
+    if abs(x) <= 1:
+        return round(x, 6)
+    return round(x / 100.0, 6)
+
+
 def apply_tw_fundamental_sanity(bundle: dict[str, Any]) -> None:
     """排除明顯錯誤（如 ROE>100%、毛利率>100%）。"""
     roe = bundle.get("roe")
@@ -605,4 +623,5 @@ __all__ = [
     "normalize_percent_ratio",
     "normalize_tw_percent_fields",
     "apply_tw_fundamental_sanity",
+    "tw_percent_display_to_api_ratio",
 ]
