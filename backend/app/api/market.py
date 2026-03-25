@@ -1,6 +1,3 @@
-import asyncio
-from typing import Any
-
 from fastapi import APIRouter, HTTPException, Query
 
 from app.schemas.market import (
@@ -18,6 +15,7 @@ from app.services.market_service import (
     get_multi_timeframe_summary,
     get_technical_signal_table,
     get_peer_symbols,
+    build_selection_bundle,
 )
 from app.services.scanner_service import (
     get_tw_universe,
@@ -27,16 +25,6 @@ from app.services.scanner_service import (
     get_crypto_search_pool,
 )
 router = APIRouter(prefix="/market", tags=["market"])
-
-
-def _chart_response_to_dict(chart: Any) -> dict[str, Any]:
-    if hasattr(chart, "model_dump"):
-        return chart.model_dump()
-    if hasattr(chart, "dict"):
-        return chart.dict()
-    if isinstance(chart, dict):
-        return chart
-    return {"symbol": "", "interval": "", "period": "", "candles": []}
 
 
 TW_MASTER = [
@@ -122,7 +110,7 @@ def get_market_overview(
 
 
 @router.get("/selection-bundle", response_model=SelectionBundleResponse)
-async def get_selection_bundle(
+def get_selection_bundle(
     symbol: str = Query(..., min_length=1),
     market: str = Query("TW", pattern="^(TW|US|CRYPTO)$"),
     interval: str = Query("1d"),
@@ -131,75 +119,11 @@ async def get_selection_bundle(
 ):
     """
     自選切換時一次取得 quote + detail + chart + multi-timeframe + signal-table。
-    後端以 asyncio.to_thread 並行執行同步邏輯，避免 Render 單 worker 下多支 GET 排隊造成時間軸拉長。
+    採單線程順序：先 detail（一次 hist/鎖），再 chart/mtf/signal，避免多執行緒搶同 symbol 的 hist 鎖
+    與重複 get_quote+get_detail。
     """
-    sym = str(symbol).strip()
-    mkt = str(market).strip()
-
-    def safe_quote() -> tuple[str, Any]:
-        try:
-            return ("ok", get_quote_data(sym, mkt))
-        except Exception as e:
-            return ("err", str(e)[:200])
-
-    def safe_detail() -> tuple[str, Any]:
-        try:
-            return ("ok", get_detail_data(sym, mkt))
-        except Exception as e:
-            return ("err", str(e)[:200])
-
-    def safe_chart() -> tuple[str, Any]:
-        try:
-            return ("ok", _chart_response_to_dict(get_chart_data(sym, interval, period)))
-        except Exception as e:
-            return ("err", str(e)[:200])
-
-    def safe_mtf() -> tuple[str, Any]:
-        try:
-            return ("ok", get_multi_timeframe_summary(symbol=sym, market=mkt, lang=lang))
-        except Exception as e:
-            return ("err", str(e)[:200])
-
-    def safe_sig() -> tuple[str, Any]:
-        try:
-            return ("ok", get_technical_signal_table(symbol=sym, market=mkt, lang=lang))
-        except Exception as e:
-            return ("err", str(e)[:200])
-
-    rq, rd, rc, rm, rs = await asyncio.gather(
-        asyncio.to_thread(safe_quote),
-        asyncio.to_thread(safe_detail),
-        asyncio.to_thread(safe_chart),
-        asyncio.to_thread(safe_mtf),
-        asyncio.to_thread(safe_sig),
-    )
-
-    errors: dict[str, str] = {}
-    quote: dict[str, Any] | None = rq[1] if rq[0] == "ok" else None
-    detail: dict[str, Any] | None = rd[1] if rd[0] == "ok" else None
-    chart: dict[str, Any] | None = rc[1] if rc[0] == "ok" else None
-    mtf: list[Any] | None = rm[1] if rm[0] == "ok" else None
-    sig: list[Any] | None = rs[1] if rs[0] == "ok" else None
-
-    if rq[0] != "ok":
-        errors["quote"] = str(rq[1])
-    if rd[0] != "ok":
-        errors["detail"] = str(rd[1])
-    if rc[0] != "ok":
-        errors["chart"] = str(rc[1])
-    if rm[0] != "ok":
-        errors["multi_timeframe"] = str(rm[1])
-    if rs[0] != "ok":
-        errors["signal_table"] = str(rs[1])
-
-    return SelectionBundleResponse(
-        quote=quote,
-        detail=detail,
-        chart=chart,
-        multi_timeframe=mtf,
-        signal_table=sig,
-        errors=errors or None,
-    )
+    raw = build_selection_bundle(symbol, market, interval, period, lang)
+    return SelectionBundleResponse(**raw)
 
 
 @router.get("/chart", response_model=MarketChartResponse)

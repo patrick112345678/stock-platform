@@ -1248,3 +1248,86 @@ def build_opportunity_candidates(
 
     results.sort(key=lambda x: (x.get("score") or 0, x.get("change_pct") or 0), reverse=True)
     return results[:limit]
+
+
+def _chart_model_to_dict(chart: Any) -> dict[str, Any]:
+    if isinstance(chart, dict):
+        return chart
+    if hasattr(chart, "model_dump"):
+        return chart.model_dump()
+    if hasattr(chart, "dict"):
+        return chart.dict()
+    return {"symbol": "", "interval": "", "period": "", "candles": []}
+
+
+def quote_dict_from_detail(detail: dict[str, Any], raw_symbol: str) -> dict[str, Any]:
+    """get_detail_data 已含報價欄位，避免 bundle 再打一輪 get_quote_data。"""
+    price = detail.get("price")
+    chg = detail.get("change")
+    prev = None
+    if price is not None and chg is not None:
+        try:
+            prev = float(price) - float(chg)
+        except (TypeError, ValueError):
+            prev = None
+    sym = str(detail.get("symbol") or raw_symbol).strip().upper()
+    name = detail.get("name") or sym
+    cp = detail.get("change_percent")
+    return {
+        "symbol": sym,
+        "name": name,
+        "currency": detail.get("currency"),
+        "exchange": detail.get("exchange"),
+        "price": float(price) if price is not None else 0.0,
+        "previous_close": prev,
+        "change": float(chg) if chg is not None else None,
+        "change_percent": float(cp) if cp is not None else None,
+    }
+
+
+def build_selection_bundle(
+    symbol: str,
+    market: str,
+    interval: str,
+    period: str,
+    lang: str,
+) -> dict[str, Any]:
+    """
+    自選切換用：先 get_detail_data（單次 hist/鎖與報價），再依序 chart / mtf / signal。
+    避免 asyncio.to_thread 多執行緒同時搶同一 (symbol,market) 的 hist 鎖造成實質排隊，
+    也避免 get_quote + get_detail 重複打行情。
+    """
+    errors: dict[str, str] = {}
+    sym = str(symbol).strip()
+    mkt = str(market).strip()
+
+    detail = get_detail_data(sym, mkt)
+    quote = quote_dict_from_detail(detail, sym)
+
+    try:
+        chart = get_chart_data(sym, interval, period)
+        chart_d = _chart_model_to_dict(chart)
+    except Exception as e:
+        errors["chart"] = str(e)[:200]
+        chart_d = None
+
+    try:
+        mtf = get_multi_timeframe_summary(symbol=sym, market=mkt, lang=lang)
+    except Exception as e:
+        errors["multi_timeframe"] = str(e)[:200]
+        mtf = None
+
+    try:
+        sig = get_technical_signal_table(symbol=sym, market=mkt, lang=lang)
+    except Exception as e:
+        errors["signal_table"] = str(e)[:200]
+        sig = None
+
+    return {
+        "quote": quote,
+        "detail": detail,
+        "chart": chart_d,
+        "multi_timeframe": mtf if isinstance(mtf, list) else None,
+        "signal_table": sig if isinstance(sig, list) else None,
+        "errors": errors or None,
+    }
