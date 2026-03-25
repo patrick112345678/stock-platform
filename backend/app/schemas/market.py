@@ -1,3 +1,5 @@
+from typing import Any
+
 from pydantic import BaseModel, Field
 
 
@@ -38,3 +40,14 @@ class MarketChartResponse(BaseModel):
     interval: str
     period: str
     candles: list[MarketCandleItem]
+
+
+class SelectionBundleResponse(BaseModel):
+    """切換標的時一次回傳 quote/detail/chart/mtf/signal，後端以執行緒並行，減少多支 HTTP 排隊。"""
+
+    quote: dict[str, Any] | None = None
+    detail: dict[str, Any] | None = None
+    chart: dict[str, Any] | None = None
+    multi_timeframe: list[Any] | None = None
+    signal_table: list[Any] | None = None
+    errors: dict[str, str] | None = None
