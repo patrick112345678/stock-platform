@@ -6,11 +6,12 @@
 
 import math
 import os
+import time
 
 import pandas as pd
 import requests
 from fastapi import HTTPException
-from typing import List, Dict, Any, Optional, Literal
+from typing import List, Dict, Any, Optional, Literal, Tuple
 
 from app.schemas.market import MarketCandleItem, MarketChartResponse
 from app.services.stock_data_service import get_cached_stock_data, get_cached_data, NEUTRAL_DATA_ERROR
@@ -50,6 +51,17 @@ REQUEST_HEADERS = {
     "Accept": "application/json",
 }
 EXTERNAL_REQUEST_TIMEOUT = 5.0
+
+# 台股 MIS 即時報價：短 TTL，減少與 hist 同次請求重複打證交所
+_mis_snap_cache: Dict[str, Tuple[float, Dict[str, Any]]] = {}
+
+
+def _tw_mis_cache_ttl() -> float:
+    try:
+        return max(1.0, float(os.getenv("TW_MIS_CACHE_TTL_SECONDS", "30")))
+    except ValueError:
+        return 30.0
+
 
 CMC_API_KEY = os.getenv("CMC_API_KEY")
 PoolSize = Literal["TOP100", "TOP800", "ALL"]
@@ -133,6 +145,14 @@ def fetch_tw_mis_snapshot(raw_symbol: str) -> Optional[Dict[str, Any]]:
     code = str(raw_symbol).replace(".TW", "").replace(".TWO", "").strip()
     if not code.isdigit():
         return None
+    mis_key = f"{code}_mis_quote"
+    now = time.monotonic()
+    hit = _mis_snap_cache.get(mis_key)
+    if hit is not None:
+        ts, snap = hit
+        if now - ts < _tw_mis_cache_ttl():
+            print(f"CACHE HIT: {code} (mis)")
+            return dict(snap)
     for prefix in ("tse", "otc"):
         url = f"https://mis.twse.com.tw/stock/api/getStockInfo.jsp?ex_ch={prefix}_{code}.tw"
         try:
@@ -149,11 +169,13 @@ def fetch_tw_mis_snapshot(raw_symbol: str) -> Optional[Dict[str, Any]]:
             if price is None:
                 continue
             name = row.get("nf") or row.get("n") or row.get("c")
-            return {
+            out = {
                 "price": price,
                 "previous_close": y,
                 "name": str(name).strip() if name else None,
             }
+            _mis_snap_cache[mis_key] = (now, out)
+            return out
         except Exception:
             continue
     return None

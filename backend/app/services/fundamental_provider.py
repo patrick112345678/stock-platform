@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import re
@@ -14,11 +15,25 @@ from datetime import datetime, timedelta
 from typing import Any, Optional
 
 import requests
+from cachetools import TTLCache
 
 _log = logging.getLogger(__name__)
 
 FINMIND_DATA_URL = "https://api.finmindtrade.com/api/v4/data"
 PROVIDER = "FINMIND_FUNDAMENTAL"
+
+
+def _finmind_fundamental_cache_ttl() -> int:
+    try:
+        return max(5, int(os.getenv("FINMIND_FUNDAMENTAL_CACHE_TTL", "60")))
+    except ValueError:
+        return 60
+
+
+_finmind_api_cache: TTLCache[str, dict[str, Any]] = TTLCache(
+    maxsize=400,
+    ttl=_finmind_fundamental_cache_ttl(),
+)
 
 _STOCK_INFO_MAP: dict[str, str] | None = None
 _STOCK_INFO_TS: float = 0.0
@@ -41,6 +56,12 @@ def _finmind_get(params: dict) -> Optional[dict]:
     tok = _token()
     if not tok:
         return None
+    cache_key = json.dumps(params, sort_keys=True, ensure_ascii=False)
+    if cache_key in _finmind_api_cache:
+        print(
+            f"CACHE HIT: finmind_api dataset={params.get('dataset')} data_id={params.get('data_id')}"
+        )
+        return dict(_finmind_api_cache[cache_key])
     headers = {
         "Authorization": f"Bearer {tok}",
         "Accept": "application/json",
@@ -69,9 +90,12 @@ def _finmind_get(params: dict) -> Optional[dict]:
         )
         return None
     try:
-        return r.json()
+        j = r.json()
     except ValueError:
         return None
+    if isinstance(j, dict):
+        _finmind_api_cache[cache_key] = j
+    return j
 
 
 def _to_float(x: Any) -> Optional[float]:

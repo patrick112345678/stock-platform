@@ -21,6 +21,7 @@ lxml
 numpy
 requests
 certifi
+cachetools>=5.3
 google-genai
 pycryptodome
 

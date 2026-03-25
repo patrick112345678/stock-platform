@@ -1,7 +1,8 @@
 """
-股票資料統一入口：依市場分流資料源，並以記憶體快取 60 秒。
+股票資料統一入口：依市場分流資料源，並以記憶體快取（預設 60 秒，STOCK_DATA_CACHE_TTL_SECONDS）。
 
 * 台股 TW 日線：FinMind 主用 → Yahoo 備援 → 僅 ENABLE_TWSE_OPENAPI=true 時才嘗試 TWSE（預設關閉，避免 Render SSL/HTML/rate limit）。
+* FinMind HTTP 另見 finmind_provider 之 TTLCache（FINMIND_KLINE_CACHE_TTL，預設 120 秒）。
 * 台股報價：見 market_service（MIS 優先 + 日線補足）。
 * 美股 US：Yahoo（us_stock_provider）。
 * Crypto：勿使用本模組。
@@ -12,6 +13,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import time
 from typing import Any, Dict, Tuple
 
@@ -27,7 +29,13 @@ from app.services.us_stock_provider import fetch_us_history_yahoo_bounded
 _log = logging.getLogger(__name__)
 
 _CACHE: Dict[str, Tuple[float, Dict[str, Any]]] = {}
-CACHE_TTL_SECONDS = 60
+
+
+def _stock_data_cache_ttl() -> float:
+    try:
+        return max(5.0, float(os.getenv("STOCK_DATA_CACHE_TTL_SECONDS", "60")))
+    except ValueError:
+        return 60.0
 
 NEUTRAL_DATA_ERROR = "資料來源暫時不可用"
 
@@ -176,9 +184,11 @@ def get_cached_stock_data(yf_symbol: str) -> Dict[str, Any]:
     key = normalize_tw_yf_symbol(raw) if _is_tw_symbol(raw) else raw
 
     now = time.monotonic()
+    ttl = _stock_data_cache_ttl()
     if key in _CACHE:
         ts, payload = _CACHE[key]
-        if now - ts < CACHE_TTL_SECONDS:
+        if now - ts < ttl:
+            print(f"CACHE HIT: {key} (stock_data hist bundle)")
             out = dict(payload)
             out["from_cache"] = True
             return out

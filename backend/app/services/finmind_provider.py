@@ -2,6 +2,7 @@
 台股日線：FinMind API v4（TaiwanStockPrice）。
 
 環境變數 FINMIND_API_TOKEN：Bearer token；未設定時由 stock_data_service 改走 Yahoo。
+FINMIND_KLINE_CACHE_TTL：K 線結果記憶體 TTL（秒），預設 120。
 """
 
 from __future__ import annotations
@@ -13,11 +14,23 @@ from typing import Any, Optional, Tuple
 
 import pandas as pd
 import requests
+from cachetools import TTLCache
 
 _log = logging.getLogger(__name__)
 
 FINMIND_DATA_URL = "https://api.finmindtrade.com/api/v4/data"
 FINMIND_PROVIDER = "FINMIND"
+
+
+def _kline_cache_ttl() -> int:
+    try:
+        return max(5, int(os.getenv("FINMIND_KLINE_CACHE_TTL", "120")))
+    except ValueError:
+        return 120
+
+
+# 程序內 TTL：與 stock_data_service 快取互補，避免繞過或 worker 內重複 HTTP
+_finmind_kline_cache: TTLCache[str, pd.DataFrame] = TTLCache(maxsize=500, ttl=_kline_cache_ttl())
 
 
 def _get_verify():
@@ -50,6 +63,14 @@ def fetch_tw_daily_history_finmind(stock_code: str) -> Tuple[Optional[pd.DataFra
     code = str(stock_code).replace(".TW", "").replace(".TWO", "").strip()
     if not code.isdigit():
         return None, "finmind_bad_code"
+
+    cache_key = f"{code}_kline"
+    if cache_key in _finmind_kline_cache:
+        print(f"CACHE HIT: {code} (finmind kline)")
+        try:
+            return _finmind_kline_cache[cache_key].copy(), None
+        except Exception:
+            pass
 
     end = datetime.now().date()
     start = end - timedelta(days=400)
@@ -167,6 +188,10 @@ def fetch_tw_daily_history_finmind(stock_code: str) -> Tuple[Optional[pd.DataFra
     df = df.sort_values("Datetime").drop_duplicates(subset=["Datetime"])
     df = df.set_index("Datetime")
     df.index.name = None
+    try:
+        _finmind_kline_cache[cache_key] = df.copy()
+    except Exception:
+        pass
     return df, None
 
 
