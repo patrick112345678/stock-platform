@@ -13,6 +13,14 @@ import json
 from app.services.fundamental_provider import strip_tw_trailing_code_in_name
 from app.db.database import SessionLocal
 from sqlalchemy import text
+from app.services.crypto_provider_health import (
+    both_exchanges_down,
+    is_exchange_down,
+    log_crypto_throttled,
+    mark_exchange_down,
+    note_exchange_success,
+    should_attempt_crypto_background_scan,
+)
 
 BYBIT_BASE_URL = "https://api.bybit.com"
 BINANCE_API_BASE = "https://api.binance.com/api/v3"
@@ -462,12 +470,19 @@ def get_bybit_spot_tickers() -> List[Dict[str, Any]]:
     url = f"{BYBIT_BASE_URL}/v5/market/tickers"
     params = {"category": "spot"}
     r = requests.get(url, params=params, timeout=5, headers=REQUEST_HEADERS)
+    if r.status_code == 403:
+        mark_exchange_down("bybit")
+        log_crypto_throttled(
+            "bybit:tickers:403",
+            "[crypto] provider=BYBIT HTTP 403 spot tickers -> cooldown",
+        )
     r.raise_for_status()
     data = r.json()
 
     if data.get("retCode") != 0:
         raise ValueError(f"Bybit API error: {data}")
 
+    note_exchange_success("bybit")
     return data["result"]["list"]
 
 
@@ -501,7 +516,11 @@ def get_bybit_kline(symbol: str, interval: str = "D", limit: int = 120) -> pd.Da
     }
     r = requests.get(url, params=params, timeout=5, headers=REQUEST_HEADERS)
     if r.status_code == 403:
-        print(f"[crypto] provider=BYBIT HTTP 403 kline symbol={symbol} interval={interval} -> fallback BINANCE")
+        mark_exchange_down("bybit")
+        log_crypto_throttled(
+            "bybit:kline:403",
+            f"[crypto] provider=BYBIT HTTP 403 kline symbol={symbol} interval={interval} -> cooldown",
+        )
     r.raise_for_status()
     data = r.json()
 
@@ -528,6 +547,7 @@ def get_bybit_kline(symbol: str, interval: str = "D", limit: int = 120) -> pd.Da
     if len(df) < 2:
         raise ValueError(f"crypto K 線不足: {symbol}")
 
+    note_exchange_success("bybit")
     return df
 
 
@@ -541,6 +561,12 @@ def get_binance_kline(symbol: str, interval: str = "D", limit: int = 120) -> pd.
         timeout=5,
         headers=REQUEST_HEADERS,
     )
+    if r.status_code in (403, 451, 418):
+        mark_exchange_down("binance")
+        log_crypto_throttled(
+            f"binance:kline:{r.status_code}",
+            f"[crypto] provider=BINANCE HTTP {r.status_code} kline symbol={symbol} interval={bi}",
+        )
     r.raise_for_status()
     raw = r.json()
     if not raw:
@@ -567,6 +593,7 @@ def get_binance_kline(symbol: str, interval: str = "D", limit: int = 120) -> pd.
     if len(df) < 2:
         raise ValueError(f"Binance crypto K 線不足: {symbol}")
 
+    note_exchange_success("binance")
     return df
 
 
@@ -575,30 +602,50 @@ def get_crypto_kline_with_fallback(symbol: str, interval: str = "D", limit: int 
     預設 Binance 主來源（避免先打 Bybit 再 403）；Bybit 可選備援。
     環境變數：CRYPTO_KLINE_PRIMARY=binance|bybit，CRYPTO_ENABLE_BYBIT_FALLBACK=true|false
     """
+    if both_exchanges_down():
+        log_crypto_throttled(
+            "crypto:kline:both_cooldown",
+            "[crypto] kline skip: binance+bybit in outage window (no per-symbol HTTP)",
+        )
+        raise ValueError(f"加密 K 線暫不可用的（兩所冷卻）: {symbol}")
+
     primary = os.getenv("CRYPTO_KLINE_PRIMARY", "binance").strip().lower()
+    fallback_on = os.getenv("CRYPTO_ENABLE_BYBIT_FALLBACK", "true").lower() in ("1", "true", "yes", "on")
+
     if primary == "bybit":
-        try:
-            return get_bybit_kline(symbol, interval, limit), "BYBIT"
-        except Exception as e:
-            print("[crypto] BYBIT kline primary failed, fallback BINANCE", symbol, repr(e))
+        if not is_exchange_down("bybit"):
+            try:
+                return get_bybit_kline(symbol, interval, limit), "BYBIT"
+            except Exception as e:
+                log_crypto_throttled(
+                    "crypto:kline:bybit_primary_fail",
+                    f"[crypto] BYBIT kline primary failed {symbol} -> try BINANCE: {type(e).__name__}",
+                )
+        if fallback_on and not is_exchange_down("binance"):
             try:
                 return get_binance_kline(symbol, interval, limit), "BINANCE"
             except Exception as e2:
                 raise ValueError(
                     f"加密 K 線暫時無法取得（Bybit 與 Binance 皆失敗）: {symbol}"
                 ) from e2
-    try:
-        return get_binance_kline(symbol, interval, limit), "BINANCE"
-    except Exception as e:
-        print("[crypto] BINANCE kline primary failed", symbol, repr(e))
-        if os.getenv("CRYPTO_ENABLE_BYBIT_FALLBACK", "true").lower() in ("1", "true", "yes", "on"):
-            try:
-                return get_bybit_kline(symbol, interval, limit), "BYBIT"
-            except Exception as e2:
-                raise ValueError(
-                    f"加密 K 線暫時無法取得（Binance 與 Bybit 皆失敗）: {symbol}"
-                ) from e2
-        raise ValueError(f"加密 K 線暫時無法取得: {symbol}") from e
+        raise ValueError(f"加密 K 線暫時無法取得: {symbol}")
+
+    if not is_exchange_down("binance"):
+        try:
+            return get_binance_kline(symbol, interval, limit), "BINANCE"
+        except Exception as e:
+            log_crypto_throttled(
+                "crypto:kline:binance_primary_fail",
+                f"[crypto] BINANCE kline primary failed {symbol}: {type(e).__name__}",
+            )
+    if fallback_on and not is_exchange_down("bybit"):
+        try:
+            return get_bybit_kline(symbol, interval, limit), "BYBIT"
+        except Exception as e2:
+            raise ValueError(
+                f"加密 K 線暫時無法取得（Binance 與 Bybit 皆失敗）: {symbol}"
+            ) from e2
+    raise ValueError(f"加密 K 線暫時無法取得: {symbol}")
 
 
 def get_binance_spot_tickers_normalized() -> List[Dict[str, Any]]:
@@ -608,6 +655,12 @@ def get_binance_spot_tickers_normalized() -> List[Dict[str, Any]]:
         timeout=5,
         headers=REQUEST_HEADERS,
     )
+    if r.status_code in (403, 451, 418):
+        mark_exchange_down("binance")
+        log_crypto_throttled(
+            f"binance:tickers:{r.status_code}",
+            f"[crypto] provider=BINANCE HTTP {r.status_code} ticker/24hr (all)",
+        )
     r.raise_for_status()
     data = r.json()
     out: List[Dict[str, Any]] = []
@@ -630,22 +683,37 @@ def get_binance_spot_tickers_normalized() -> List[Dict[str, Any]]:
                 "turnover24h": str(qv),
             }
         )
+    note_exchange_success("binance")
     return out
 
 
 def get_spot_tickers_with_fallback() -> List[Dict[str, Any]]:
     primary = os.getenv("CRYPTO_TICKERS_PRIMARY", "binance").strip().lower()
     if primary == "bybit":
-        try:
-            return get_bybit_spot_tickers()
-        except Exception as e:
-            print("WARN Bybit spot tickers failed, using Binance:", repr(e))
+        if not is_exchange_down("bybit"):
+            try:
+                return get_bybit_spot_tickers()
+            except Exception as e:
+                log_crypto_throttled(
+                    "tickers:bybit_fail",
+                    f"[crypto] Bybit spot tickers failed, try Binance: {type(e).__name__}",
+                )
+        if not is_exchange_down("binance"):
             return get_binance_spot_tickers_normalized()
-    try:
-        return get_binance_spot_tickers_normalized()
-    except Exception as e:
-        print("WARN Binance spot tickers failed, using Bybit:", repr(e))
+        log_crypto_throttled("tickers:none", "[crypto] spot tickers: both exchanges down or failed")
+        raise ValueError("crypto spot tickers unavailable")
+    if not is_exchange_down("binance"):
+        try:
+            return get_binance_spot_tickers_normalized()
+        except Exception as e:
+            log_crypto_throttled(
+                "tickers:binance_fail",
+                f"[crypto] Binance spot tickers failed, try Bybit: {type(e).__name__}",
+            )
+    if not is_exchange_down("bybit"):
         return get_bybit_spot_tickers()
+    log_crypto_throttled("tickers:none2", "[crypto] spot tickers: no provider")
+    raise ValueError("crypto spot tickers unavailable")
 
 
 def _fetch_twse_stock_day_all() -> List[Dict[str, Any]]:
@@ -990,6 +1058,9 @@ def process_crypto_symbol(symbol: str):
             upsert_price_from_scanner_item,
         )
 
+        if both_exchanges_down():
+            return None
+
         df, exch = get_crypto_kline_with_fallback(symbol)
         item = build_opportunity_from_df(
             df=df,
@@ -1022,6 +1093,33 @@ def run_parallel(symbols: List[str], processor, max_workers: int = 8) -> List[Di
 
     return results
 
+
+def preflight_crypto_scan_batch() -> bool:
+    """
+    背景掃描前單線程試拉 BTC K 線；失敗則本輪不對多 symbol 平行轟炸。
+    ENABLE_CRYPTO_BACKGROUND_SCAN=false 時直接略過。
+    """
+    if not should_attempt_crypto_background_scan():
+        log_crypto_throttled(
+            "scanner:crypto:disabled",
+            "[scanner] ENABLE_CRYPTO_BACKGROUND_SCAN off — skip crypto cache refresh",
+        )
+        return False
+    if both_exchanges_down():
+        log_crypto_throttled(
+            "scanner:crypto:preflight_cooldown",
+            "[scanner] skip crypto batch (binance+bybit cooldown)",
+        )
+        return False
+    try:
+        get_crypto_kline_with_fallback("BTCUSDT", "D", 5)
+        return True
+    except Exception as e:
+        log_crypto_throttled(
+            "scanner:crypto:preflight_err",
+            f"[scanner] crypto kline preflight failed, skip batch: {type(e).__name__}: {str(e)[:220]}",
+        )
+        return False
 
 
 def get_us_opportunities(limit=20):
@@ -1079,7 +1177,12 @@ def get_stock_leaderboard(sort: str = "change_percent", limit: int = 20) -> List
 
 
 def get_crypto_leaderboard(sort: str = "change_percent", limit: int = 20) -> List[Dict[str, Any]]:
-    tickers = get_spot_tickers_with_fallback()
+    try:
+        tickers = get_spot_tickers_with_fallback()
+    except Exception as e:
+        log_crypto_throttled("crypto:leaderboard:tickers", f"[crypto] leaderboard tickers fail: {type(e).__name__}")
+        return []
+
     results = []
 
     for item in tickers:

@@ -30,6 +30,7 @@ from app.services.scanner_service import (
     process_us_symbol,
     process_tw_symbol,
     process_crypto_symbol,
+    preflight_crypto_scan_batch,
     run_parallel,
     save_scanner_results,
     is_scanner_cache_recent,
@@ -154,10 +155,16 @@ async def scanner_background_job():
             tw_results = sorted(tw_results, key=lambda x: x["score"], reverse=True)
             await asyncio.to_thread(save_scanner_results, tw_results, "TW")
 
-            crypto_symbols = get_crypto_universe("ALL")
-            crypto_results = await asyncio.to_thread(run_parallel, crypto_symbols, process_crypto_symbol)
-            crypto_results = sorted(crypto_results, key=lambda x: x["score"], reverse=True)
-            await asyncio.to_thread(save_scanner_results, crypto_results, "CRYPTO")
+            if preflight_crypto_scan_batch():
+                crypto_symbols = get_crypto_universe("ALL")
+                max_cw = int(os.getenv("CRYPTO_SCAN_MAX_WORKERS", "2") or "2")
+                crypto_results = await asyncio.to_thread(
+                    run_parallel, crypto_symbols, process_crypto_symbol, max(1, max_cw)
+                )
+                crypto_results = sorted(crypto_results, key=lambda x: x["score"], reverse=True)
+                await asyncio.to_thread(save_scanner_results, crypto_results, "CRYPTO")
+            else:
+                print("🟡 background scanner: skip CRYPTO (preflight failed or ENABLE_CRYPTO_BACKGROUND_SCAN=off)")
 
             # 註解：後台重啟時不自動跑 AI 今日機會（省 token）
             # for market in ("US", "TW", "CRYPTO"):
@@ -194,8 +201,13 @@ async def scanner_cache_10min_job():
                         syms = get_tw_universe(pool)
                         res = await asyncio.to_thread(run_parallel, syms, process_tw_symbol)
                     else:
+                        if not preflight_crypto_scan_batch():
+                            continue
                         syms = get_crypto_universe(pool)
-                        res = await asyncio.to_thread(run_parallel, syms, process_crypto_symbol)
+                        max_cw = int(os.getenv("CRYPTO_SCAN_MAX_WORKERS", "2") or "2")
+                        res = await asyncio.to_thread(
+                            run_parallel, syms, process_crypto_symbol, max(1, max_cw)
+                        )
                     res = sorted(res, key=lambda x: x.get("score", 0), reverse=True)
                     await asyncio.to_thread(save_scanner_results, res, market)
                 except Exception as e:

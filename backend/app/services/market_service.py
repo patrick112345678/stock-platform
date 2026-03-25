@@ -36,6 +36,12 @@ from app.services.scanner_service import (
     get_us_universe,
     get_crypto_universe,
 )
+from app.services.crypto_provider_health import (
+    is_exchange_down,
+    log_crypto_throttled,
+    mark_exchange_down,
+    note_exchange_success,
+)
 
 BYBIT_BASE_URL = "https://api.bybit.com"
 BINANCE_API_BASE = "https://api.binance.com/api/v3"
@@ -165,18 +171,27 @@ def get_bybit_spot_symbols():
 
 
 def _binance_ticker_row(symbol: str) -> dict:
+    if is_exchange_down("binance"):
+        raise ValueError("binance_quote_cooldown")
     r = requests.get(
         f"{BINANCE_API_BASE}/ticker/24hr",
         params={"symbol": symbol},
         timeout=EXTERNAL_REQUEST_TIMEOUT,
         headers=REQUEST_HEADERS,
     )
+    if r.status_code in (403, 451, 418):
+        mark_exchange_down("binance")
+        log_crypto_throttled(
+            f"binance:ticker24h:{r.status_code}",
+            f"[crypto] BINANCE HTTP {r.status_code} ticker/24hr symbol={symbol}",
+        )
     r.raise_for_status()
     t = r.json()
     lp = safe_float(t.get("lastPrice"))
     op = safe_float(t.get("openPrice"))
     pcp = safe_float(t.get("priceChangePercent"))
     frac = (pcp / 100.0) if pcp is not None else None
+    note_exchange_success("binance")
     return {
         "lastPrice": str(lp) if lp is not None else None,
         "prevPrice24h": str(op) if op is not None else None,
@@ -187,9 +202,17 @@ def _binance_ticker_row(symbol: str) -> dict:
 
 def get_ticker_bybit(symbol: str) -> dict:
     """Bybit 現貨 ticker（備援用）。"""
+    if is_exchange_down("bybit"):
+        raise ValueError("bybit_quote_cooldown")
     url = f"{BYBIT_BASE_URL}/v5/market/tickers"
     params = {"category": "spot", "symbol": symbol}
     resp = requests.get(url, params=params, timeout=EXTERNAL_REQUEST_TIMEOUT, headers=REQUEST_HEADERS)
+    if resp.status_code == 403:
+        mark_exchange_down("bybit")
+        log_crypto_throttled(
+            "bybit:ticker:403",
+            f"[crypto] BYBIT HTTP 403 ticker symbol={symbol}",
+        )
     resp.raise_for_status()
     data = resp.json()
     if data.get("retCode") != 0:
@@ -199,38 +222,61 @@ def get_ticker_bybit(symbol: str) -> dict:
         raise ValueError("Bybit empty list")
     row = dict(items[0])
     row["_exchange"] = "BYBIT"
+    note_exchange_success("bybit")
     return row
 
 
 def get_crypto_ticker_row(symbol: str) -> dict:
     """預設 Binance 主來源，避免先打 Bybit 再 403；Bybit 可選備援。"""
     primary = os.getenv("CRYPTO_QUOTE_PRIMARY", "binance").strip().lower()
+    fallback_on = os.getenv("CRYPTO_ENABLE_BYBIT_FALLBACK", "true").lower() in ("1", "true", "yes", "on")
+
     if primary == "bybit":
-        try:
-            return get_ticker_bybit(symbol)
-        except Exception as e:
-            print("[crypto] BYBIT primary failed, fallback BINANCE ticker", symbol, repr(e))
-            row = _binance_ticker_row(symbol)
-            row["_exchange"] = "BINANCE"
-            return row
-    try:
-        row = _binance_ticker_row(symbol)
-        row["_exchange"] = "BINANCE"
-        return row
-    except Exception as e:
-        if os.getenv("CRYPTO_ENABLE_BYBIT_FALLBACK", "true").lower() in ("1", "true", "yes", "on"):
-            print("[crypto] BINANCE primary failed, fallback BYBIT ticker", symbol, repr(e))
+        if not is_exchange_down("bybit"):
             try:
                 return get_ticker_bybit(symbol)
+            except Exception as e:
+                log_crypto_throttled(
+                    "quote:bybit_primary",
+                    f"[crypto] BYBIT quote primary fail {symbol} -> BINANCE: {type(e).__name__}",
+                )
+        if not is_exchange_down("binance"):
+            try:
+                row = _binance_ticker_row(symbol)
+                row["_exchange"] = "BINANCE"
+                return row
             except Exception as e2:
                 raise HTTPException(
                     status_code=404,
-                    detail="加密貨幣報價暫時無法取得（Binance 與 Bybit 皆失敗），請稍後再試。",
+                    detail="加密貨幣報價暫時無法取得（Bybit 與 Binance 皆失敗），請稍後再試。",
                 ) from e2
         raise HTTPException(
             status_code=404,
             detail="加密貨幣報價暫時無法取得，請稍後再試。",
-        ) from e
+        )
+
+    if not is_exchange_down("binance"):
+        try:
+            row = _binance_ticker_row(symbol)
+            row["_exchange"] = "BINANCE"
+            return row
+        except Exception as e:
+            log_crypto_throttled(
+                "quote:binance_primary",
+                f"[crypto] BINANCE quote primary fail {symbol}: {type(e).__name__}",
+            )
+    if fallback_on and not is_exchange_down("bybit"):
+        try:
+            return get_ticker_bybit(symbol)
+        except Exception as e2:
+            raise HTTPException(
+                status_code=404,
+                detail="加密貨幣報價暫時無法取得（Binance 與 Bybit 皆失敗），請稍後再試。",
+            ) from e2
+    raise HTTPException(
+        status_code=404,
+        detail="加密貨幣報價暫時無法取得，請稍後再試。",
+    )
 
 
 def build_crypto_quote_data(symbol: str):
