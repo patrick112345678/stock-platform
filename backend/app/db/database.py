@@ -25,6 +25,21 @@ if DATABASE_URL.startswith("postgresql") and os.getenv("RENDER"):
     if "sslmode=" not in DATABASE_URL and "ssl=" not in DATABASE_URL.lower():
         _engine_kw["connect_args"] = {"sslmode": "require"}
 
+# 正式環境多使用者時適度放大連線池，避免請求排隊等連線（非「語法」問題，是併發資源）
+if DATABASE_URL.startswith("postgresql"):
+    try:
+        _engine_kw["pool_size"] = max(2, int(os.getenv("DB_POOL_SIZE", "8")))
+    except ValueError:
+        _engine_kw["pool_size"] = 8
+    try:
+        _engine_kw["max_overflow"] = max(0, int(os.getenv("DB_MAX_OVERFLOW", "16")))
+    except ValueError:
+        _engine_kw["max_overflow"] = 16
+    try:
+        _engine_kw["pool_recycle"] = max(300, int(os.getenv("DB_POOL_RECYCLE", "1800")))
+    except ValueError:
+        _engine_kw["pool_recycle"] = 1800
+
 engine = create_engine(DATABASE_URL, **_engine_kw)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
